@@ -1,0 +1,58 @@
+-- Jx: small helpers over @unison/json shared by every module in this repo.
+
+Jx.get : Text -> Json -> Optional Json
+Jx.get k = cases
+  Json.Object kvs -> match List.find (cases (n, _) -> n == k) kvs with
+    Some (_, v) -> Some v
+    None -> None
+  _ -> None
+
+Jx.text : Json -> Optional Text
+Jx.text = cases
+  Json.Text t -> Some t
+  _ -> None
+
+Jx.nat : Json -> Optional Nat
+Jx.nat = cases
+  Json.Number t -> Nat.fromText t
+  _ -> None
+
+Jx.getText : Text -> Json -> Optional Text
+Jx.getText k j = match Jx.get k j with
+  Some v -> Jx.text v
+  None -> None
+
+Jx.getNat : Text -> Json -> Optional Nat
+Jx.getNat k j = match Jx.get k j with
+  Some v -> Jx.nat v
+  None -> None
+
+Jx.getTexts : Text -> Json -> [Text]
+Jx.getTexts k j = match Jx.get k j with
+  Some (Json.Array xs) -> List.filterMap Jx.text xs
+  _ -> []
+
+Jx.need : Text -> Optional a ->{Exception} a
+Jx.need what = cases
+  Some a -> a
+  None -> Exception.raiseGeneric ("missing " ++ what) what
+
+Jx.message : Failure -> Text
+Jx.message = cases Failure _ m _ -> m
+
+-- JSON-RPC 2.0 request line body
+Jx.request : Json -> Text -> Json -> Text
+Jx.request id method params =
+  Json.toText (Json.Object [("jsonrpc", Json.Text "2.0"), ("id", id), ("method", Json.Text method), ("params", params)])
+
+Jx.notification : Text -> Text
+Jx.notification method =
+  Json.toText (Json.Object [("jsonrpc", Json.Text "2.0"), ("method", Json.Text method)])
+
+Jx.response : Json -> Json -> Text
+Jx.response id result =
+  Json.toText (Json.Object [("jsonrpc", Json.Text "2.0"), ("id", id), ("result", result)])
+
+Jx.errorResponse : Json -> Int -> Text -> Text
+Jx.errorResponse id code msg =
+  Json.toText (Json.Object [("jsonrpc", Json.Text "2.0"), ("id", id), ("error", Json.Object [("code", Json.int code), ("message", Json.Text msg)])])

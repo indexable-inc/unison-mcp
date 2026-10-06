@@ -1,0 +1,137 @@
+-- Stdio: a JSON-RPC client over a child process's stdin/stdout, with health check,
+-- per-call timeout (polling, never blocks forever) and kill. Generic: knows nothing about ucm.
+
+-- stdin, stdout, process, and the child's pid (its shell prints it on stderr before exec)
+unique type Stdio.Child = Child Handle Handle Process (Promise Text)
+
+-- Timeout: no reply in time. Dead: the process exited or a pipe broke. Rpc: the server answered with a JSON-RPC error object.
+unique type Stdio.Error = Timeout | Dead Text | Rpc Json
+
+Stdio.Error.describe : Stdio.Error -> Text
+Stdio.Error.describe = cases
+  Stdio.Error.Timeout -> "timeout"
+  Stdio.Error.Dead why -> "child process died: " ++ why
+  Stdio.Error.Rpc j -> "rpc error: " ++ Json.toText j
+
+Stdio.hin : Stdio.Child -> Handle
+Stdio.hin = cases Stdio.Child.Child i _ _ _ -> i
+
+Stdio.hout : Stdio.Child -> Handle
+Stdio.hout = cases Stdio.Child.Child _ o _ _ -> o
+
+Stdio.proc : Stdio.Child -> Process
+Stdio.proc = cases Stdio.Child.Child _ _ p _ -> p
+
+Stdio.pidPromise : Stdio.Child -> Promise Text
+Stdio.pidPromise = cases Stdio.Child.Child _ _ _ q -> q
+
+-- the first stderr line is the child's pid; the rest is discarded so a full pipe never blocks the child
+Stdio.drain : Handle -> Promise Text ->{IO} ()
+Stdio.drain h pid =
+  loop : '{IO, Exception} ()
+  loop = do
+    _ = getLine h
+    loop()
+  _ = Exception.catch do Promise.write_ pid (getLine h)
+  match Exception.catch loop with
+    _ -> ()
+
+-- Start through `sh -c 'echo $$ >&2; exec cmd args'` so we know the pid: Process.kill sends a
+-- signal ucm only acts on after the running computation ends, so stop needs `kill -9`.
+Stdio.spawn : Text -> [Text] ->{IO, Exception} Stdio.Child
+Stdio.spawn cmd args =
+  (hin, hout, herr, proc) = Process.start "/bin/sh" (["-c", "echo $$ >&2; exec \"$0\" \"$@\"", cmd] List.++ args)
+  setBuffering hin NoBuffering
+  pid = Promise.new()
+  concurrent.fork_ do Stdio.drain herr pid
+  Stdio.Child.Child hin hout proc pid
+
+Stdio.isAlive : Stdio.Child ->{IO} Boolean
+Stdio.isAlive c = match Process.exitCode (Stdio.proc c) with
+  None -> true
+  Some _ -> false
+
+-- kill -9 the child and reap it; safe on an already dead child
+Stdio.stop : Stdio.Child ->{IO} ()
+Stdio.stop c =
+  match Promise.tryRead (Stdio.pidPromise c) with
+    Some pid -> match Exception.catch do Process.call "/bin/kill" ["-9", Text.trim pid] with
+      _ -> ()
+    None -> ()
+  _ = Exception.catch do Process.kill (Stdio.proc c)
+  _ = Exception.catch do Handle.close (Stdio.hin c)
+  _ = Exception.catch do Process.wait (Stdio.proc c)
+  ()
+
+-- monotonic milliseconds (0 when the clock fails, which makes every deadline expire at once)
+Stdio.nowMs : '{IO} Nat
+Stdio.nowMs = do match Exception.catch do Clock.monotonic() with
+  Right d -> Int.truncate0 (Duration.countMillisecondsInt d)
+  Left _ -> 0
+
+Stdio.expired : Nat ->{IO} Boolean
+Stdio.expired deadline = match !Stdio.nowMs with
+  0 -> true
+  now -> now >= deadline
+
+-- wait for a reader thread's line until the monotonic deadline (ms)
+Stdio.pollLine : Promise (Either Text Text) -> Nat ->{IO} Either Stdio.Error Text
+Stdio.pollLine p deadline = match Promise.tryRead p with
+  Some (Right t) -> Right t
+  Some (Left why) -> Left (Stdio.Error.Dead why)
+  None ->
+    if Stdio.expired deadline then Left Stdio.Error.Timeout
+    else
+      _ = Exception.catch do sleepMicroseconds 5000
+      Stdio.pollLine p deadline
+
+-- next line from the child before the deadline. Handle.ready and getLine block the whole
+-- runtime on a pipe, so a reader thread does the blocking read and this function polls it;
+-- a reader left blocked by a timeout ends when the caller stops (kills) the child.
+Stdio.readLine : Stdio.Child -> Nat ->{IO} Either Stdio.Error Text
+Stdio.readLine c deadline =
+  p = Promise.new()
+  concurrent.fork_ do
+    r = match Exception.catch do getLine (Stdio.hout c) with
+      Left f -> Left (Jx.message f)
+      Right t -> Right t
+    Promise.write_ p r
+  Stdio.pollLine p deadline
+
+-- read until the reply carrying `id`; other lines (notifications, noise) are skipped
+Stdio.await : Stdio.Child -> Json -> Nat ->{IO} Either Stdio.Error Json
+Stdio.await c id deadline = match Stdio.readLine c deadline with
+  Left e -> Left e
+  Right line -> match Exception.catch do Json.fromText line with
+    Left _ -> Stdio.await c id deadline
+    Right j ->
+      if Jx.get "id" j === Some id then
+        match Jx.get "error" j with
+          Some e -> Left (Stdio.Error.Rpc e)
+          None -> match Jx.get "result" j with
+            Some r -> Right r
+            None -> Right Json.Null
+      else Stdio.await c id deadline
+
+-- one request, one reply, bounded by timeoutMs
+Stdio.call : Stdio.Child -> Nat -> Json -> Text -> Json ->{IO} Either Stdio.Error Json
+Stdio.call c timeoutMs id method params =
+  match Exception.catch do putText (Stdio.hin c) (Jx.request id method params ++ "\n") with
+    Left f -> Left (Stdio.Error.Dead (Jx.message f))
+    Right _ -> Stdio.await c id (!Stdio.nowMs + timeoutMs)
+
+Stdio.initParams : Json
+Stdio.initParams = Json.Object [("protocolVersion", Json.Text "2025-03-26"), ("capabilities", Json.Object []), ("clientInfo", Json.Object [("name", Json.Text "unison-mcp"), ("version", Json.Text "0.1")])]
+
+-- spawn and run the MCP initialize handshake; the child is stopped on failure
+Stdio.start : Text -> [Text] -> Nat ->{IO} Either Stdio.Error Stdio.Child
+Stdio.start cmd args timeoutMs =
+  match Exception.catch do Stdio.spawn cmd args with
+    Left f -> Left (Stdio.Error.Dead (Jx.message f))
+    Right c -> match Stdio.call c timeoutMs (Json.nat 1) "initialize" Stdio.initParams with
+      Left e ->
+        Stdio.stop c
+        Left e
+      Right _ ->
+        _ = Exception.catch do putText (Stdio.hin c) (Jx.notification "notifications/initialized" ++ "\n")
+        Right c
