@@ -104,6 +104,27 @@ Use `Mcp.run do ...` for the real handler and `Mcp.fake f do ...` for a test dou
 
 CDP is not JSON-RPC 2.0: a `"jsonrpc"` member makes Chrome ignore the message, so `Cdp` sends only `id`, `method`, `params`.
 
+## Self-evolving codebase (optional, off by default)
+
+Agents add definitions to the codebase through `action: "update"`. To keep them, the server can commit every successful change to a **private** git repo; this public repo contains only the mechanism and no personal path, repo name or data.
+
+```
+Claude Code --update--> server (Server.evolve) --stdin: reply text--> unison-evolve commit   (detaches at once, never fails the call)
+                                                   | lock (mkdir built under a temp name, renamed), then
+                                                   | sqlite online backup of the codebase -> REPO/codebase/unison.sqlite3
+                                                   | ucm on a copy of the snapshot -> REPO/export/{INDEX.txt,head.txt,libs.txt,defs/<name>.u}
+                                                   `-- git commit "update: Foo.bar, ..." (session, lane, head), signed per git config
+```
+
+- Public (this repo): `scripts/evolve.py` (installed as `unison-evolve`), the hook and the `sync` action in `src/server.u`, guide topic `evolve`, `tests/evolve.py`.
+- Private (the user's repo, for example `unison-codebase`): the snapshot, the export, personal modules (example Superhuman config, a `servers.json` template without tokens), `.secrets-allow`. Token state files under `~/.local/share/uni/mcp/*.json` are never committed (the scan refuses them).
+- Switch on with `UNISON_MCP_EVOLVE_REPO=/path/to/private/repo` in the environment or in `~/.local/share/uni/unison-mcp.env` (sourced by the launcher; `UNISON_MCP_CONFIG` names another file). Optional: `UNISON_MCP_LANE` (named in the commit), `UNISON_MCP_EVOLVE_PUSH=1` (push after each commit, after the secrets scan; default is local commits only), `UNISON_MCP_EVOLVE_SIGN=0`.
+- Triggers: `update`, `install`, `run` with `name` and `code`, and raw `tool` calls to update-definitions, delete-definitions, delete-namespace, rename-definition, move-definition, move-to, lib-install. Failed updates and scratch cells commit nothing. Every successful update gets its own commit (an empty diff is allowed when a concurrent session's snapshot already contained it). Errors only go to `REPO/.git/unison-evolve.log`.
+- `action: "sync"` stops this session's ucm child, fast-forwards the repo from `origin`, replaces the live codebase by the pulled snapshot only when it has no changes the repo lacks and no other ucm holds it, runs the secrets scan and pushes.
+- `unison-evolve restore --codebase CB --repo REPO REV` puts an older snapshot back (refuses while a ucm holds CB; the states before and after are commits). `verify` checks integrity, that the export equals a fresh export of the snapshot, and optionally the live head. `scan [--accept]` is the secrets scan.
+- Why plain git and not LFS: the codebase is a 28 MB sqlite whose pages mostly do not move. The online backup API keeps the page layout, so a snapshot packs to a delta of a few KB; `VACUUM INTO` would reshuffle pages and defeat that. Loose commits are repacked (`git repack -a -d`) when they exceed 40 MiB.
+- The text export is the diff and merge surface, the sqlite is the truth: the export does not carry the GUID of `unique type`s, so a rebuild from text alone gives such types (and what depends on them) new hashes.
+
 ## Design
 
 - `src/jx.u` JSON helpers. `src/stdio.u` supervised JSON-RPC client over a child process (health check by exit code, per-call deadline on a monotonic clock, kill -9 on stop). `src/mcp.u` generic MCP client. `src/cdp.u` CDP. `src/server.u` the one-tool server. `examples/` vendor-specific modules. `ORDER` is the load order.
@@ -116,6 +137,7 @@ CDP is not JSON-RPC 2.0: a `"jsonrpc"` member makes Chrome ignore the message, s
 
 - `scripts/build.sh CODEBASE [OUT.uc]` loads `ORDER` into a (new or existing) codebase and compiles `Server.main`. `UNISON_MCP_PRE` holds ucm commands to run first (migrations).
 - `scripts/check.sh CODEBASE` rebuilds the repo into a temp codebase and compares (name, hash) of every definition in our namespaces with `CODEBASE`: repo == codebase. Run it with no ucm holding `CODEBASE`.
+- `python3 -I tests/evolve.py` the self-evolving codebase on throwaway copies: one commit per update naming the definition, two concurrent sessions give two commits and a consistent store, a failing update commits nothing, restore brings back the previous definition, sync pushes after the secrets scan and pulls into a clean clone.
 - `python3 -I tests/integration.py` scripted JSON-RPC over stdio against the real launcher and ucm: `tools/list` is one tool, a type error is data, `> 1 + 2`, the error classes, `run`, the timeout kills the child and the server recovers, restart after the child is killed, process-group cleanup on stdin close and SIGTERM, and a headless Chrome on a throwaway profile and a random port (navigate to a `data:` URL, eval, read text, click, type, screenshot; never the browser on :9222).
 
 ## Licence
