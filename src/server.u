@@ -1,22 +1,32 @@
 -- Server: an MCP server (stdio) that exposes ONE tool, `unison`, and proxies it to the many tools of
 -- `ucm mcp` running as a supervised child process. See Server.main for the environment it reads.
 
-unique type Server.Config = Config Text Text Text Text Nat
+-- ucm, codebase, project, branch, call timeout ms, session id (this server's pid: unique scratch names), idle ms before the child exits, ms to wait for ucm to start
+unique type Server.Config = Config Text Text Text Text Nat Text Nat Nat
 
 Server.Config.ucm : Server.Config -> Text
-Server.Config.ucm = cases Server.Config.Config u _ _ _ _ -> u
+Server.Config.ucm = cases Server.Config.Config u _ _ _ _ _ _ _ -> u
 
 Server.Config.codebase : Server.Config -> Text
-Server.Config.codebase = cases Server.Config.Config _ c _ _ _ -> c
+Server.Config.codebase = cases Server.Config.Config _ c _ _ _ _ _ _ -> c
 
 Server.Config.project : Server.Config -> Text
-Server.Config.project = cases Server.Config.Config _ _ p _ _ -> p
+Server.Config.project = cases Server.Config.Config _ _ p _ _ _ _ _ -> p
 
 Server.Config.branch : Server.Config -> Text
-Server.Config.branch = cases Server.Config.Config _ _ _ b _ -> b
+Server.Config.branch = cases Server.Config.Config _ _ _ b _ _ _ _ -> b
 
 Server.Config.timeoutMs : Server.Config -> Nat
-Server.Config.timeoutMs = cases Server.Config.Config _ _ _ _ t -> t
+Server.Config.timeoutMs = cases Server.Config.Config _ _ _ _ t _ _ _ -> t
+
+Server.Config.sid : Server.Config -> Text
+Server.Config.sid = cases Server.Config.Config _ _ _ _ _ x _ _ -> x
+
+Server.Config.idleMs : Server.Config -> Nat
+Server.Config.idleMs = cases Server.Config.Config _ _ _ _ _ _ i _ -> i
+
+Server.Config.startMs : Server.Config -> Nat
+Server.Config.startMs = cases Server.Config.Config _ _ _ _ _ _ _ w -> w
 
 -- isError (infrastructure failure: timeout, dead child), text
 unique type Server.Out = Out Boolean Text
@@ -133,8 +143,8 @@ Server.pc cfg args =
 Server.indent : Text -> Text
 Server.indent code = Text.join "\n" (List.map (l -> "  " ++ l) (Text.lines code))
 
-Server.cellName : Text
-Server.cellName = "scratch.mcpCell"
+Server.cellName : Server.Config -> Text
+Server.cellName cfg = "scratch.mcpCell_" ++ Server.Config.sid cfg
 
 -- ---------- guide ----------
 
@@ -175,21 +185,22 @@ Server.isDefLine l =
 Server.splitProgram : Text -> Optional (Text, Text)
 Server.splitProgram code =
   ls = Text.lines code
-  if List.find Server.isDefLine ls === None then None
-  else match List.reverse (Server.dropBlank (List.reverse ls)) with
+  match List.reverse (Server.dropBlank (List.reverse ls)) with
     [] -> None
     all ->
       lastLine = Optional.getOrElse "" (List.last all)
       body = Text.join "\n" (List.take (List.size all - 1) all)
+      -- a final `> expr` line always means file form; a bare final expression only after definitions
       if Text.startsWith "> " lastLine then Some (body, Text.drop 2 lastLine)
+      else if List.find Server.isDefLine ls === None then None
       else if Server.col0 lastLine && not (Text.startsWith "--" lastLine) && not (Text.startsWith "test>" lastLine) && not (Text.contains " = " lastLine) && not (Server.isDefLine lastLine) then Some (body, lastLine)
       else None
 
-Server.progNs : Text
-Server.progNs = "scratch.mcpRun"
+Server.progNs : Server.Config -> Text
+Server.progNs cfg = "scratch.mcpRun_" ++ Server.Config.sid cfg
 
-Server.progEntry : Text
-Server.progEntry = "scratch.mcpRun.mcpEntry"
+Server.progEntry : Server.Config -> Text
+Server.progEntry cfg = Server.progNs cfg ++ ".mcpEntry"
 
 -- ---------- big results ----------
 
@@ -276,29 +287,29 @@ Server.act cfg c seq args =
           Right (true, _) -> fin (runName n)
         (None, Some body) -> match Server.splitProgram body with
          Some (defs, expr) ->
-          cell = "namespace " ++ Server.progNs ++ "\n\n" ++ defs ++ "\n\nmcpEntry = do\n" ++ Server.indent expr ++ "\n"
+          cell = "namespace " ++ Server.progNs cfg ++ "\n\n" ++ defs ++ "\n\nmcpEntry = do\n" ++ Server.indent expr ++ "\n"
           match Server.step "update" c ms base "update-definitions" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text cell)])]) with
             Left e -> Left e
             Right (false, t) -> Right t
             Right (true, _) ->
-              r = runName Server.progEntry
+              r = runName (Server.progEntry cfg)
               match r with
                 Left e -> Left e
                 Right _ ->
-                  _ = Server.callTool c 30000 (base + 4) "delete-definitions" (Json.Object [("projectContext", pc), ("names", Json.Array [Json.Text Server.progEntry]), ("force", Json.Boolean true)])
+                  _ = Server.callTool c 30000 (base + 4) "delete-definitions" (Json.Object [("projectContext", pc), ("names", Json.Array [Json.Text (Server.progEntry cfg)]), ("force", Json.Boolean true)])
                   fin r
          None ->
-          cell = Server.cellName ++ " = do\n" ++ Server.indent body ++ "\n"
+          cell = Server.cellName cfg ++ " = do\n" ++ Server.indent body ++ "\n"
           match Server.step "update" c ms base "update-definitions" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text cell)])]) with
             Left e -> Left e
             Right (false, t) -> Right t
             Right (true, _) ->
-              r = runName Server.cellName
+              r = runName (Server.cellName cfg)
               -- clean up the scratch cell only when the child is still usable (never after a timeout)
               match r with
                 Left e -> Left e
                 Right _ ->
-                  _ = Server.callTool c 30000 (base + 4) "delete-definitions" (Json.Object [("projectContext", pc), ("names", Json.Array [Json.Text Server.cellName]), ("force", Json.Boolean true)])
+                  _ = Server.callTool c 30000 (base + 4) "delete-definitions" (Json.Object [("projectContext", pc), ("names", Json.Array [Json.Text (Server.cellName cfg)]), ("force", Json.Boolean true)])
                   fin r
         (None, None) -> usage "run needs 'name' or 'code'"
     "view" -> match need "name" with
@@ -360,10 +371,27 @@ Server.act cfg c seq args =
           Right _ -> usage "json must be an object"
     other -> usage ("unknown action '" ++ other ++ "'")
 
--- start (or restart) the ucm child when it is missing or dead
-Server.ensure : Server.Config -> Optional Stdio.Child ->{IO} Either Stdio.Error Stdio.Child
+-- saturating now - then
+Server.since : Nat -> Nat -> Nat
+Server.since now then_ = if now > then_ then Int.truncate0 (Nat.toInt now - Nat.toInt then_) else 0
+
+-- start ucm, retrying with backoff (250 ms doubling to 2 s) until startMs have passed: another
+-- process may hold the codebase lock. Right child, or Left (last error, ms waited)
+Server.startRetry : Server.Config -> Nat -> Nat ->{IO} Either (Stdio.Error, Nat) Stdio.Child
+Server.startRetry cfg t0 delay =
+  match Stdio.start (Server.Config.ucm cfg) ["mcp", "-C", Server.Config.codebase cfg] 20000 with
+    Right c -> Right c
+    Left e ->
+      waited = Server.since !Stdio.nowMs t0
+      if waited + delay >= Server.Config.startMs cfg then Left (e, waited)
+      else
+        _ = Exception.catch do sleepMicroseconds (delay * 1000)
+        Server.startRetry cfg t0 (Nat.min 2000 (delay * 2))
+
+-- the ucm child is lazy: started on the first call that needs it, missing or dead is restarted
+Server.ensure : Server.Config -> Optional Stdio.Child ->{IO} Either (Stdio.Error, Nat) Stdio.Child
 Server.ensure cfg child =
-  start = do Stdio.start (Server.Config.ucm cfg) ["mcp", "-C", Server.Config.codebase cfg] 120000
+  start = do Server.startRetry cfg !Stdio.nowMs 250
   match child with
     Some c ->
       if Stdio.isAlive c then Right c
@@ -372,6 +400,10 @@ Server.ensure cfg child =
         !start
     None -> !start
 
+Server.startFailText : Nat -> Stdio.Error -> Text
+Server.startFailText waited e =
+  Server.header "unison" false "timeout" ++ "ucm did not start within " ++ Nat.toText waited ++ " ms: the codebase lock is probably held by another ucm (a terminal session, a transcript or an install); retry later. Last error: " ++ Stdio.Error.describe e
+
 -- one tool call: supervise the child, never let a transport failure escape
 Server.exec : Server.Config -> Optional Stdio.Child -> Nat -> Json -> (Server.Out, Optional Stdio.Child)
 Server.exec cfg child seq args =
@@ -379,7 +411,7 @@ Server.exec cfg child seq args =
     Some n -> n
     None -> Server.Config.timeoutMs cfg
   match Server.ensure cfg child with
-    Left e -> (Server.Out.Out true (Server.failText ms e), None)
+    Left (e, waited) -> (Server.Out.Out true (Server.startFailText waited e), None)
     Right c -> match Server.act cfg c seq args with
       Left e ->
         Stdio.stop c
@@ -447,22 +479,57 @@ Server.onLine cfg child seq line = match Exception.catch do Json.fromText line w
           Server.reply (Jx.errorResponse id -32601 ("method not found: " ++ method))
           child
 
-Server.loop : Server.Config -> Optional Stdio.Child -> Nat ->{IO, Exception} ()
-Server.loop cfg child seq = match Exception.catch do getLine stdIn with
-  Left _ -> match child with
-    Some c -> Stdio.stop c
-    None -> ()
-  Right line ->
-    if Text.size (Text.trim line) == 0 then Server.loop cfg child seq
-    else Server.loop cfg (Server.onLine cfg child seq line) (seq + 1)
+-- wait for the next stdin line (read on a thread: a blocking read would stall the idle check).
+-- While waiting, the ucm child is stopped once it has been idle for idleMs, so it never holds
+-- the codebase lock between calls. Returns the line result and the (maybe stopped) child.
+Server.waitLine : Server.Config -> Optional Stdio.Child -> Promise (Either Text Text) -> Nat ->{IO} (Either Text Text, Optional Stdio.Child)
+Server.waitLine cfg child p lastMs = match Promise.tryRead p with
+  Some r -> (r, child)
+  None ->
+    stopIdle = match child with
+      Some c -> if Server.since !Stdio.nowMs lastMs >= Server.Config.idleMs cfg then
+          Stdio.stop c
+          None
+        else child
+      None -> None
+    _ = Exception.catch do sleepMicroseconds 20000
+    Server.waitLine cfg stopIdle p lastMs
+
+Server.loop : Server.Config -> Optional Stdio.Child -> Nat -> Nat ->{IO, Exception} ()
+Server.loop cfg child seq lastMs =
+  p = Promise.new()
+  concurrent.fork_ do
+    r = match Exception.catch do getLine stdIn with
+      Left f -> Left (Jx.message f)
+      Right t -> Right t
+    Promise.write_ p r
+  match Server.waitLine cfg child p lastMs with
+    (Left _, child2) -> match child2 with
+      Some c -> Stdio.stop c
+      None -> ()
+    (Right line, child2) ->
+      if Text.size (Text.trim line) == 0 then Server.loop cfg child2 seq lastMs
+      else
+        child3 = Server.onLine cfg child2 seq line
+        Server.loop cfg child3 (seq + 1) !Stdio.nowMs
+
+-- unique id of this server: the pid of the sh we spawn is not ours, but its parent (`$PPID`) is
+Server.sessionId : '{IO, Exception} Text
+Server.sessionId = do
+  (i, o, e, p) = Process.start "/bin/sh" ["-c", "echo $PPID"]
+  t = Text.trim (getText o)
+  _ = Process.wait p
+  if Text.size t == 0 then "0" else t
 
 -- Environment: UNISON_MCP_UCM (path of the `unison` binary of the pinned ucm), UNISON_MCP_CODEBASE
--- (codebase directory), optional UNISON_MCP_PROJECT / UNISON_MCP_BRANCH (default main/main) and
+-- (codebase directory), optional UNISON_MCP_CHILD_UCM (ucm for the child, default UNISON_MCP_UCM),
+-- UNISON_MCP_IDLE_MS (child exits after this idle time, default 4000), UNISON_MCP_START_WAIT_MS (retry
+-- window when ucm will not start, default 20000), UNISON_MCP_PROJECT / UNISON_MCP_BRANCH (default main/main) and
 -- UNISON_MCP_TIMEOUT_MS (default 120000).
 Server.main : '{IO, Exception} ()
 Server.main = do
   setBuffering stdOut NoBuffering
-  ucm = Server.env "UNISON_MCP_UCM" "ucm"
+  ucm = Server.env "UNISON_MCP_CHILD_UCM" (Server.env "UNISON_MCP_UCM" "ucm")
   cb = Server.env "UNISON_MCP_CODEBASE" ""
-  cfg = Server.Config.Config ucm cb (Server.env "UNISON_MCP_PROJECT" "main") (Server.env "UNISON_MCP_BRANCH" "main") (Optional.getOrElse 120000 (Nat.fromText (Server.env "UNISON_MCP_TIMEOUT_MS" "120000")))
-  Server.loop cfg None 1
+  cfg = Server.Config.Config ucm cb (Server.env "UNISON_MCP_PROJECT" "main") (Server.env "UNISON_MCP_BRANCH" "main") (Optional.getOrElse 120000 (Nat.fromText (Server.env "UNISON_MCP_TIMEOUT_MS" "120000"))) !Server.sessionId (Optional.getOrElse 4000 (Nat.fromText (Server.env "UNISON_MCP_IDLE_MS" "4000"))) (Optional.getOrElse 20000 (Nat.fromText (Server.env "UNISON_MCP_START_WAIT_MS" "20000")))
+  Server.loop cfg None 1 !Stdio.nowMs
