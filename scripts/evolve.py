@@ -142,6 +142,7 @@ def snapshot(codebase, dest):
             dst = sqlite3.connect(tmp)
             with dst:
                 src.backup(dst)
+            dst.execute("pragma journal_mode = delete")  # a plain file: no -wal/-shm beside the snapshot
             dst.close()
             src.close()
             os.replace(tmp, dest)
