@@ -1,0 +1,5 @@
+# sha256 of the pinned ucm 1.5.0 (release/1.5.0, built 2026-09-29, macOS arm64), read from the installed files 2026-10-06.
+# Tarball: https://github.com/unisonweb/unison/releases/download/release/1.5.0/ucm-macos-arm64.tar.gz
+3e1d6a978235a8f989a584e332e670eca18c15f1099fcf1881fc126b62bdbeae  ucm-macos-arm64.tar.gz
+b6cccfdf0e39fc95b33c93a06f2415a88538cd13304a6ab2a9f56fa43a610100  ucm
+d55bac7438028ff7bee9a460f107781aa48f1163f5a00495881c20354bf6cc69  unison/unison
