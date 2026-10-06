@@ -28,7 +28,9 @@ Claude Code --stdio--> bin/unison-mcp (launcher, own process group)
 
 The launcher checks `unison/unison` against `ucm.pin` on every start (`UNISON_MCP_SKIP_PIN_CHECK=1` skips), runs the server in its own process group, and kills that whole group when stdin closes or on SIGTERM/SIGHUP/SIGINT.
 
-Environment: `UNISON_MCP_CODEBASE` (default `~/.local/share/uni/codebase`), `UNISON_MCP_UCM_DIR`, `UNISON_MCP_PROGRAM`, `UNISON_MCP_PROJECT` / `UNISON_MCP_BRANCH` (default `main`/`main`), `UNISON_MCP_TIMEOUT_MS` (default 120000).
+**Lazy, short-lived ucm child.** The server spawns `ucm mcp` on the first call that needs it (`initialize`, `tools/list` and `ping` never do), and stops it after `UNISON_MCP_IDLE_MS` (default 4000) without a call, so an idle server holds nothing. Several launchers (several Claude sessions) can run at once and interleave calls; each names its scratch cells with its own pid (`scratch.mcpCell_<pid>`, `scratch.mcpRun_<pid>`), so sessions never run each other's cells. A CLI `ucm` (an install, a transcript) waits for the codebase lock while any `ucm mcp` child is alive; with idle children it gets the lock a few seconds after the last call. If ucm will not start (for example because something holds the lock), the server retries with backoff (250 ms doubling to 2 s) for `UNISON_MCP_START_WAIT_MS` (default 20000) and then replies `class: timeout` with a message about the codebase lock.
+
+Environment: `UNISON_MCP_CODEBASE` (default `~/.local/share/uni/codebase`), `UNISON_MCP_UCM_DIR`, `UNISON_MCP_PROGRAM`, `UNISON_MCP_PROJECT` / `UNISON_MCP_BRANCH` (default `main`/`main`), `UNISON_MCP_TIMEOUT_MS` (default 120000), `UNISON_MCP_IDLE_MS`, `UNISON_MCP_START_WAIT_MS`, `UNISON_MCP_CHILD_UCM` (ucm binary for the child only; tests use a fake).
 
 ## The tool
 

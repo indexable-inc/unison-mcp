@@ -197,6 +197,15 @@ class Unison(Base):
         err, text = self.c.tool(action="run", code="g : Nat\ng = 1")
         self.assertIn("ok: false", text)
 
+    def test_final_watch_line_is_file_form_without_signatures(self):
+        err, text = self.c.tool(action="run", code="x = 40 + 2\n\n> x")
+        self.assertIn("ok: true", text, text)
+        self.assertTrue(text.rstrip().endswith("42"), text)
+        # control: a plain do-body without a `>` line still runs as a body
+        err, text = self.c.tool(action="run", code="y = 40 + 3\ny")
+        self.assertIn("ok: true", text, text)
+        self.assertTrue(text.rstrip().endswith("43"), text)
+
     def test_big_result_is_cut_and_spilled_to_a_file(self):
         err, small = self.c.tool(action="run", code='Text.join "" (List.replicate 100 do "ab")')
         self.assertNotIn("cut,", small)
@@ -283,6 +292,68 @@ class Supervision(Base):
         c2.p.wait(10)
         time.sleep(1.0)
         self.assertEqual(ours(), [], "SIGTERM on the launcher must kill the whole group")
+
+
+def children(cb=None):
+    return [r for r in ours() if "mcp -C" in r[2]]
+
+
+class Lazy(Base):
+    """the ucm child is lazy and short-lived, so launchers share the codebase with each other and with the CLI."""
+
+    ENV = {"UNISON_MCP_IDLE_MS": "1500"}
+
+    def test_no_child_until_a_call_and_none_after_idle(self):
+        c = Client(self.ENV)
+        self.addCleanup(c.close)
+        c.rpc("tools/list")
+        c.rpc("ping")
+        self.assertEqual(children(), [], "initialize and tools/list need no ucm")
+        self.assertIn("ok: true", c.tool(code="> 1")[1])
+        self.assertEqual(len(children()), 1)
+        time.sleep(4)
+        self.assertEqual(children(), [], "the child must exit after the idle time")
+        self.assertIn("3", c.tool(code="> 1 + 2")[1])  # respawns on the next call
+        self.assertEqual(len(children()), 1)
+
+    def test_two_launchers_interleave_and_the_cli_can_take_the_codebase(self):
+        a, b = Client(self.ENV), Client(self.ENV)
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        for i in range(4):
+            ra = a.tool(action="run", code=f"{100 + i} + 1")[1]
+            rb = b.tool(action="run", code=f"{200 + i} + 1")[1]
+            self.assertTrue(ra.rstrip().endswith(str(101 + i)), ra)  # each session ran its own cell
+            self.assertTrue(rb.rstrip().endswith(str(201 + i)), rb)
+        self.assertEqual(len(children()), 2)
+        time.sleep(4)
+        self.assertEqual(children(), [])
+        # idle launchers no longer hold the lock: a CLI ucm (install, transcript) gets it
+        t = os.path.join(TEST_DIR, "cli.md")
+        open(t, "w").write("```ucm\nscratch/main> switch main/main\n```\n")
+        r = subprocess.run([os.path.join(UCM_DIR, "ucm"), "-c", CB, "transcript.in-place", t], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout[-500:] + r.stderr[-500:])
+        self.assertIn("ok: true", a.tool(code="> 5")[1])
+
+    def test_ucm_that_will_not_start_gives_timeout_class(self):
+        # a fake ucm that exits at once, as one that cannot take the codebase lock does
+        fake = os.path.join(TEST_DIR, "fake-ucm.sh")
+        open(fake, "w").write("#!/bin/sh\necho 'Waiting for codebase lock...' >&2\nexit 1\n")
+        os.chmod(fake, 0o755)
+        c = Client({"UNISON_MCP_CHILD_UCM": fake, "UNISON_MCP_START_WAIT_MS": "2500"})
+        self.addCleanup(c.close)
+        t = time.time()
+        err, text = c.tool(code="> 1")
+        took = time.time() - t
+        self.assertTrue(err)
+        self.assertIn("class: timeout", text)
+        self.assertIn("codebase lock", text)
+        self.assertGreater(took, 1.5, "must keep retrying until the window is nearly used")
+        self.assertLess(took, 12)
+        # control: the same launcher shape with the real ucm works
+        d = Client(self.ENV)
+        self.addCleanup(d.close)
+        self.assertIn("ok: true", d.tool(code="> 1")[1])
 
 
 def free_port():
