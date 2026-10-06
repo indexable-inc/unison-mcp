@@ -1,0 +1,44 @@
+#!/bin/bash
+# unison-mcp launcher: a stdio MCP server with ONE tool, `unison`.
+#   UNISON_MCP_CODEBASE   codebase directory (default ~/.local/share/uni/codebase)
+#   UNISON_MCP_UCM_DIR    directory of the pinned ucm release (default ~/.local/share/uni/ucm/release-1.5.0)
+#   UNISON_MCP_PROGRAM    compiled server (default <this script>.uc, else server.uc next to it)
+#   UNISON_MCP_SKIP_PIN_CHECK=1 skips the sha256 check of the ucm binary against ucm.pin
+# The server runs in its own process group together with the `ucm mcp` child it supervises;
+# when this script exits (stdin closed, SIGTERM, SIGHUP, SIGINT) the whole group is killed.
+set -u
+self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ucm_dir="${UNISON_MCP_UCM_DIR:-$HOME/.local/share/uni/ucm/release-1.5.0}"
+export UNISON_MCP_CODEBASE="${UNISON_MCP_CODEBASE:-$HOME/.local/share/uni/codebase}"
+export UNISON_MCP_UCM="$ucm_dir/unison/unison"
+prog="${UNISON_MCP_PROGRAM:-}"
+if [ -z "$prog" ]; then
+  for c in "$self/$(basename "${BASH_SOURCE[0]}").uc" "$self/server.uc" "$self/../server.uc"; do
+    [ -f "$c" ] && prog="$c" && break
+  done
+fi
+[ -f "$prog" ] || { echo "unison-mcp: compiled server not found (run scripts/build.sh CODEBASE server.uc)" >&2; exit 1; }
+[ -x "$UNISON_MCP_UCM" ] || { echo "unison-mcp: no ucm at $UNISON_MCP_UCM (see README: pinned ucm)" >&2; exit 1; }
+export UCM_WEB_UI="$ucm_dir/ui"
+if [ "${UNISON_MCP_SKIP_PIN_CHECK:-0}" != 1 ]; then
+  want="$(awk '$2=="unison/unison"{print $1}' "$self/ucm.pin" "$self/../ucm.pin" 2>/dev/null | head -n1)"
+  if [ -n "$want" ]; then
+    got="$(shasum -a 256 "$UNISON_MCP_UCM" | awk '{print $1}')"
+    [ "$got" = "$want" ] || { echo "unison-mcp: $UNISON_MCP_UCM does not match the pinned sha256 (see ucm.pin)" >&2; exit 1; }
+  fi
+fi
+
+set -m   # each background job gets its own process group (pgid == pid)
+"$UNISON_MCP_UCM" run.compiled "$prog" <&0 &
+pid=$!
+cleanup() {
+  trap '' TERM HUP INT
+  kill -TERM -- "-$pid" 2>/dev/null
+  sleep 0.3
+  kill -KILL -- "-$pid" 2>/dev/null
+}
+trap 'cleanup; exit 143' TERM HUP INT
+wait "$pid"
+rc=$?
+cleanup
+exit "$rc"

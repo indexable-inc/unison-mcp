@@ -1,0 +1,369 @@
+-- Server: an MCP server (stdio) that exposes ONE tool, `unison`, and proxies it to the many tools of
+-- `ucm mcp` running as a supervised child process. See Server.main for the environment it reads.
+
+unique type Server.Config = Config Text Text Text Text Nat
+
+Server.Config.ucm : Server.Config -> Text
+Server.Config.ucm = cases Server.Config.Config u _ _ _ _ -> u
+
+Server.Config.codebase : Server.Config -> Text
+Server.Config.codebase = cases Server.Config.Config _ c _ _ _ -> c
+
+Server.Config.project : Server.Config -> Text
+Server.Config.project = cases Server.Config.Config _ _ p _ _ -> p
+
+Server.Config.branch : Server.Config -> Text
+Server.Config.branch = cases Server.Config.Config _ _ _ b _ -> b
+
+Server.Config.timeoutMs : Server.Config -> Nat
+Server.Config.timeoutMs = cases Server.Config.Config _ _ _ _ t -> t
+
+-- isError (infrastructure failure: timeout, dead child), text
+unique type Server.Out = Out Boolean Text
+
+Server.env : Text -> Text ->{IO} Text
+Server.env k d = match Exception.catch do IO.getEnv k with
+  Right v -> if Text.size v == 0 then d else v
+  Left _ -> d
+
+-- ---------- the tool ----------
+
+Server.toolName : Text
+Server.toolName = "unison"
+
+Server.description : Text
+Server.description = Text.join "\n" [
+  "This is the user's general REPL and MCP client as well as the Unison tool. One call runs Unison (ucm 1.5) code on the local codebase (project/branch default main/main). Anything below is done by running a Unison cell with action 'run' (code = the body of a do block); do NOT conclude that Unison cannot do it.",
+  "Capabilities, each with a one-line cell:",
+  "  MCP client for any server (stdio or streamable HTTP, OAuth sign-in with a browser pop-up, token refresh, e.g. Superhuman): servers are listed in ~/.local/share/uni/mcp/servers.json. Sign in: Mcp.login \"superhuman\". Call: Mcp.run do Mcp.call \"superhuman\" \"list_threads\" \"{\\\"limit\\\":3}\" . Typed Superhuman wrappers: Mcp.run do Superhuman.listThreads 3. List tools: Mcp.run do Mcp.tools \"superhuman\".",
+  "  Chrome over CDP (the user's signed-in browser at http://127.0.0.1:9222, Cdp.endpoint): Cdp.connect Cdp.endpoint \"github.com\" do !Cdp.readPage (find or open a tab, return its text). Also Cdp.navigate url, Cdp.eval js, Cdp.waitFor (Cdp.Wait.Selector \"#id\") 5000, Cdp.click selector, Cdp.typeText selector text, Cdp.screenshot path, Cdp.targets Cdp.endpoint. Commands: Cdp.call \"Page.reload\" \"{}\".",
+  "  Processes: (i, o, e, p) = Process.start \"git\" [\"status\", \"-s\"]  then getText o  (Process.wait p gives the exit code). Files: readFileUtf8 (FilePath \"/abs/path\"), writeFileUtf8 (FilePath \"/abs/path\") text. HTTP: Threads.run do Http.run do HttpResponse.bodyText (Http.get (URI.parse \"https://example.com\")).",
+  "  Writing and testing Unison itself: check, update, view, search, tests and the other actions below.",
+  "Compile errors are DATA: the reply starts with 'stage:', 'ok:' and 'class:' (wrong-name, ambiguous-name, type-mismatch, unhandled-ability, parse-error, timeout, child-died, none). The exit status is never the verdict.",
+  "Actions (input 'action'; default 'check' when only 'code' is given):",
+  "  check: typecheck 'code'; lines starting with '> expr' are evaluated (pure) and 'test> name = check (..)' are run. Nothing is saved.",
+  "  run: with 'name' run that definition ('args' are its arguments); with 'code' and no 'name' the code is the BODY of a do block of type '{IO, Exception} a, run and discarded; with both, code is updated into the codebase and then 'name' is run.",
+  "  update: typecheck and write 'code' into the codebase (nothing is written on error). view: source of definitions in 'name' (space or comma separated). search: find definitions by name ('name'). type-search: by type ('name' or 'code', e.g. [a] -> Nat). install: lib.install the Share project in 'name' (@unison/base; optional args[0] = branch). docs: docs for 'name'. tests: run tests in subnamespace 'name' (empty = project). diff: preview an update of 'code'. guide: the full Unison language guide (read it once before writing non-trivial code). tools: list the underlying ucm tools. tool: call one underlying ucm tool by 'name' with 'json' arguments (projectContext is added when missing).",
+  "Other inputs: timeout_ms (per call, default 120000; on timeout the ucm child is killed and restarts on the next call), project, branch.",
+  "Traps: look up every library name first with action 'search' (guessed names were the top error); named functions are never infix (write Nat.mod a b, never a Nat.mod b; only symbolic operators like + == ++ are infix); higher-order functions take the function first (List.foreach printLine xs); == is per type, lists need === or List.equals; effects need the right abilities (main : '{IO, Exception} ()); a program that needs IO is run with action 'run', not 'check'; give each program a unique name since run can pick an older committed one; ucm exits 0 even on compile errors, so read 'ok:'."]
+
+Server.schema : Json
+Server.schema =
+  str d = Json.Object [("type", Json.Text "string"), ("description", Json.Text d)]
+  actions = Json.Array (List.map Json.Text ["check", "run", "update", "view", "search", "type-search", "install", "docs", "tests", "diff", "guide", "tools", "tool"])
+  Json.Object [
+    ("type", Json.Text "object"),
+    ("properties", Json.Object [
+      ("code", str "Unison source (check, update, diff, type-search) or the body of a do block (run without name)."),
+      ("action", Json.Object [("type", Json.Text "string"), ("enum", actions), ("description", Json.Text "What to do; default check.")]),
+      ("name", str "Definition name(s), search query, library project, tests subnamespace or raw tool name, depending on action."),
+      ("args", Json.Object [("type", Json.Text "array"), ("items", Json.Object [("type", Json.Text "string")]), ("description", Json.Text "Arguments of the run main function, or [branch] for install.")]),
+      ("json", str "Raw JSON arguments for action tool."),
+      ("timeout_ms", Json.Object [("type", Json.Text "integer"), ("description", Json.Text "Per-call timeout in milliseconds; default 120000.")]),
+      ("project", str "Project name; default main."),
+      ("branch", str "Branch name; default main.")])]
+
+Server.toolDef : Json
+Server.toolDef = Json.Object [("name", Json.Text Server.toolName), ("description", Json.Text Server.description), ("inputSchema", Server.schema)]
+
+-- ---------- classification and formatting ----------
+
+Server.classify : Text -> Text
+Server.classify t =
+  has s = Text.contains s t
+  if has "I couldn't figure out what" && has "ambiguous" then "ambiguous-name"
+  else if has "I couldn't figure out what" || has "were not found" || has "couldn't find a function" || has "I couldn't find" then "wrong-name"
+  else if has "I found a value" && has "where I expected" then "type-mismatch"
+  else if has "needs the {" || has "needs the  {" then "unhandled-ability"
+  else if has "I got confused here" || has "I was surprised" then "parse-error"
+  else if has "ambiguous" then "ambiguous-name"
+  else "error"
+
+Server.header : Text -> Boolean -> Text -> Text
+Server.header stage ok cls =
+  "stage: " ++ stage ++ "\nok: " ++ (if ok then "true" else "false") ++ "\nclass: " ++ cls ++ "\n\n"
+
+Server.contentText : Json -> Text
+Server.contentText r = match Jx.get "content" r with
+  Some (Json.Array items) -> Text.join "\n" (List.filterMap (Jx.getText "text") items)
+  _ -> Json.toText r
+
+Server.isErrorFlag : Json -> Boolean
+Server.isErrorFlag r = match Jx.get "isError" r with
+  Some (Json.Boolean b) -> b
+  _ -> false
+
+Server.noise : Text -> Boolean
+Server.noise m = Text.startsWith "Loading changes detected" m || Text.trim m == "No changes found."
+
+-- a ucm tool result (JSON text inside content) as stage/ok/class header plus messages
+Server.report : Text -> Json -> (Boolean, Text)
+Server.report stage r =
+  txt = Server.contentText r
+  flag = Server.isErrorFlag r
+  match Exception.catch do Json.fromText txt with
+    Right j | Jx.get "errorMessages" j !== None ->
+      errs = Jx.getTexts "errorMessages" j
+      outs = List.filter (m -> not (Server.noise m)) (Jx.getTexts "outputMessages" j)
+      extra = List.filter (s -> Text.size (Text.trim s) > 0) (List.filterMap (k -> Jx.getText k j) ["stdout", "stderr"])
+      ok = List.size errs == 0 && not flag
+      body = if ok then outs List.++ extra else errs List.++ extra
+      cls = if ok then "none" else Server.classify (Text.join "\n" errs)
+      (ok, Server.header stage ok cls ++ Text.join "\n\n" body)
+    _ ->
+      cls = if flag then Server.classify txt else "none"
+      (not flag, Server.header stage (not flag) cls ++ txt)
+
+Server.failText : Nat -> Stdio.Error -> Text
+Server.failText ms = cases
+  Stdio.Error.Timeout -> Server.header "unison" false "timeout" ++ "no reply within " ++ Nat.toText ms ++ " ms; the ucm child was killed and restarts on the next call"
+  Stdio.Error.Dead why -> Server.header "unison" false "child-died" ++ "ucm child died (" ++ why ++ "); it restarts on the next call"
+  Stdio.Error.Rpc j -> Server.header "unison" false "rpc-error" ++ Json.toText j
+
+-- ---------- calling the child ----------
+
+Server.callTool : Stdio.Child -> Nat -> Nat -> Text -> Json ->{IO} Either Stdio.Error Json
+Server.callTool c ms id tool arguments =
+  Stdio.call c ms (Json.nat id) "tools/call" (Json.Object [("name", Json.Text tool), ("arguments", arguments)])
+
+Server.pc : Server.Config -> Json -> Json
+Server.pc cfg args =
+  p = match Jx.getText "project" args with
+    Some x -> x
+    None -> Server.Config.project cfg
+  b = match Jx.getText "branch" args with
+    Some x -> x
+    None -> Server.Config.branch cfg
+  Json.Object [("projectName", Json.Text p), ("branchName", Json.Text b)]
+
+Server.indent : Text -> Text
+Server.indent code = Text.join "\n" (List.map (l -> "  " ++ l) (Text.lines code))
+
+Server.cellName : Text
+Server.cellName = "scratch.mcpCell"
+
+-- run one tool and format it
+Server.step : Text -> Stdio.Child -> Nat -> Nat -> Text -> Json ->{IO} Either Stdio.Error (Boolean, Text)
+Server.step stage c ms id tool arguments = match Server.callTool c ms id tool arguments with
+  Left e -> Left e
+  Right r -> Right (Server.report stage r)
+
+Server.reqText : Text -> Json ->{Exception} Text
+Server.reqText k args = Jx.need ("input '" ++ k ++ "'") (Jx.getText k args)
+
+Server.splitNames : Text -> [Text]
+Server.splitNames t = List.filter (s -> Text.size s > 0) (Text.split ?\s (Text.join " " (Text.split ?, t)))
+
+-- the action dispatcher: Right (ok, text) or a transport error
+Server.act : Server.Config -> Stdio.Child -> Nat -> Json ->{IO} Either Stdio.Error Text
+Server.act cfg c seq args =
+  ms = match Jx.getNat "timeout_ms" args with
+    Some n -> n
+    None -> Server.Config.timeoutMs cfg
+  base = seq * 10
+  pc = Server.pc cfg args
+  action = match Jx.getText "action" args with
+    Some a -> a
+    None -> "check"
+  code = Jx.getText "code" args
+  name = Jx.getText "name" args
+  fin = cases
+    Left e -> Left e
+    Right (_, t) -> Right t
+  need k = match Exception.catch do Server.reqText k args with
+    Right t -> Right t
+    Left f -> Left (Stdio.Error.Dead (Jx.message f))
+  usage msg = Right (Server.header action false "usage" ++ msg)
+  match action with
+    "check" -> match code with
+      None -> usage "check needs 'code'"
+      Some src -> fin (Server.step "typecheck" c ms base "typecheck-code" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text src)])]))
+    "update" -> match code with
+      None -> usage "update needs 'code'"
+      Some src -> fin (Server.step "update" c ms base "update-definitions" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text src)])]))
+    "diff" -> match code with
+      None -> usage "diff needs 'code'"
+      Some src -> fin (Server.step "diff" c ms base "diff-update" (Json.Object [("projectContext", pc), ("code", Json.Object [("text", Json.Text src)])]))
+    "run" ->
+      runArgs = Json.Array (List.map Json.Text (Jx.getTexts "args" args))
+      runName n = Server.step "run" c ms (base + 2) "run" (Json.Object [("projectContext", pc), ("mainFunctionName", Json.Text n), ("args", runArgs)])
+      match (name, code) with
+        (Some n, None) -> fin (runName n)
+        (Some n, Some src) -> match Server.step "update" c ms base "update-definitions" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text src)])]) with
+          Left e -> Left e
+          Right (false, t) -> Right t
+          Right (true, _) -> fin (runName n)
+        (None, Some body) ->
+          cell = Server.cellName ++ " = do\n" ++ Server.indent body ++ "\n"
+          match Server.step "update" c ms base "update-definitions" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text cell)])]) with
+            Left e -> Left e
+            Right (false, t) -> Right t
+            Right (true, _) ->
+              r = runName Server.cellName
+              -- clean up the scratch cell only when the child is still usable (never after a timeout)
+              match r with
+                Left e -> Left e
+                Right _ ->
+                  _ = Server.callTool c 30000 (base + 4) "delete-definitions" (Json.Object [("projectContext", pc), ("names", Json.Array [Json.Text Server.cellName]), ("force", Json.Boolean true)])
+                  fin r
+        (None, None) -> usage "run needs 'name' or 'code'"
+    "view" -> match need "name" with
+      Left e -> Left e
+      Right n -> fin (Server.step "view" c ms base "view-definitions" (Json.Object [("projectContext", pc), ("names", Json.Array (List.map Json.Text (Server.splitNames n)))]))
+    "search" -> match need "name" with
+      Left e -> Left e
+      Right n -> fin (Server.step "search" c ms base "search-definitions-by-name" (Json.Object [("projectContext", pc), ("query", Json.Text n)]))
+    "type-search" ->
+      q = match name with
+        Some n -> Some n
+        None -> code
+      match q with
+        None -> usage "type-search needs 'name' or 'code' (a type)"
+        Some t -> fin (Server.step "type-search" c ms base "search-by-type" (Json.Object [("projectContext", pc), ("query", Json.Text t)]))
+    "install" -> match need "name" with
+      Left e -> Left e
+      Right n ->
+        branch = match List.head (Jx.getTexts "args" args) with
+          Some b -> Json.Text b
+          None -> Json.Null
+        fin (Server.step "install" c ms base "lib-install" (Json.Object [("projectContext", pc), ("libProjectName", Json.Text n), ("libBranchName", branch)]))
+    "docs" -> match need "name" with
+      Left e -> Left e
+      Right n -> fin (Server.step "docs" c ms base "docs" (Json.Object [("projectContext", pc), ("name", Json.Text n)]))
+    "tests" ->
+      sub = match name with
+        Some n -> Json.Text n
+        None -> Json.Null
+      fin (Server.step "tests" c ms base "run-tests" (Json.Object [("projectContext", pc), ("subnamespace", sub)]))
+    "guide" -> match Stdio.call c ms (Json.nat base) "resources/read" (Json.Object [("uri", Json.Text "file://unison-guide")]) with
+      Left e -> Left e
+      Right r -> match Jx.get "contents" r with
+        Some (Json.Array items) -> Right (Text.join "\n" (List.filterMap (Jx.getText "text") items))
+        _ -> Right (Json.toText r)
+    "tools" -> match Stdio.call c ms (Json.nat base) "tools/list" (Json.Object []) with
+      Left e -> Left e
+      Right r -> match Jx.get "tools" r with
+        Some (Json.Array ts) -> Right (Text.join "\n" (List.filterMap (Jx.getText "name") ts))
+        _ -> Right (Json.toText r)
+    "tool" -> match need "name" with
+      Left e -> Left e
+      Right n ->
+        raw = match Jx.getText "json" args with
+          Some j -> Exception.catch do Json.fromText j
+          None -> Right (Json.Object [])
+        match raw with
+          Left f -> usage ("json is not valid JSON: " ++ Jx.message f)
+          Right (Json.Object kvs) ->
+            withPc = match Jx.get "projectContext" (Json.Object kvs) with
+              Some _ -> kvs
+              None -> kvs List.++ [("projectContext", pc)]
+            fin (Server.step n c ms base n (Json.Object withPc))
+          Right _ -> usage "json must be an object"
+    other -> usage ("unknown action '" ++ other ++ "'")
+
+-- start (or restart) the ucm child when it is missing or dead
+Server.ensure : Server.Config -> Optional Stdio.Child ->{IO} Either Stdio.Error Stdio.Child
+Server.ensure cfg child =
+  start = do Stdio.start (Server.Config.ucm cfg) ["mcp", "-C", Server.Config.codebase cfg] 120000
+  match child with
+    Some c ->
+      if Stdio.isAlive c then Right c
+      else
+        Stdio.stop c
+        !start
+    None -> !start
+
+-- one tool call: supervise the child, never let a transport failure escape
+Server.exec : Server.Config -> Optional Stdio.Child -> Nat -> Json -> (Server.Out, Optional Stdio.Child)
+Server.exec cfg child seq args =
+  ms = match Jx.getNat "timeout_ms" args with
+    Some n -> n
+    None -> Server.Config.timeoutMs cfg
+  match Server.ensure cfg child with
+    Left e -> (Server.Out.Out true (Server.failText ms e), None)
+    Right c -> match Server.act cfg c seq args with
+      Left e ->
+        Stdio.stop c
+        (Server.Out.Out true (Server.failText ms e), None)
+      Right text -> (Server.Out.Out false text, Some c)
+
+-- ---------- JSON-RPC server ----------
+
+Server.protocol : Json -> Text
+Server.protocol params = match Jx.getText "protocolVersion" params with
+  Some v -> v
+  None -> "2025-03-26"
+
+Server.initResult : Json -> Json
+Server.initResult params = Json.Object [
+  ("protocolVersion", Json.Text (Server.protocol params)),
+  ("capabilities", Json.Object [("tools", Json.Object [])]),
+  ("serverInfo", Json.Object [("name", Json.Text "unison"), ("version", Json.Text "0.1.0")]),
+  ("instructions", Json.Text "One tool, 'unison'. Read its description; use action 'guide' for the language guide.")]
+
+Server.toolResult : Server.Out -> Json
+Server.toolResult = cases Server.Out.Out isErr text ->
+  Json.Object [("content", Json.Array [Json.Object [("type", Json.Text "text"), ("text", Json.Text text)]]), ("isError", Json.Boolean isErr)]
+
+Server.reply : Text ->{IO, Exception} ()
+Server.reply line = putText stdOut (line ++ "\n")
+
+-- process one request line; returns the (possibly restarted) child
+Server.onLine : Server.Config -> Optional Stdio.Child -> Nat -> Text ->{IO, Exception} Optional Stdio.Child
+Server.onLine cfg child seq line = match Exception.catch do Json.fromText line with
+  Left _ ->
+    Server.reply (Jx.errorResponse Json.Null -32700 "parse error")
+    child
+  Right msg ->
+    method = match Jx.getText "method" msg with
+      Some m -> m
+      None -> ""
+    params = match Jx.get "params" msg with
+      Some p -> p
+      None -> Json.Object []
+    match Jx.get "id" msg with
+      None -> child
+      Some id -> match method with
+        "initialize" ->
+          Server.reply (Jx.response id (Server.initResult params))
+          child
+        "ping" ->
+          Server.reply (Jx.response id (Json.Object []))
+          child
+        "tools/list" ->
+          Server.reply (Jx.response id (Json.Object [("tools", Json.Array [Server.toolDef])]))
+          child
+        "tools/call" ->
+          if Jx.getText "name" params === Some Server.toolName then
+            args = match Jx.get "arguments" params with
+              Some a -> a
+              None -> Json.Object []
+            (out, child2) = Server.exec cfg child seq args
+            Server.reply (Jx.response id (Server.toolResult out))
+            child2
+          else
+            Server.reply (Jx.errorResponse id -32602 "unknown tool; the only tool is 'unison'")
+            child
+        _ ->
+          Server.reply (Jx.errorResponse id -32601 ("method not found: " ++ method))
+          child
+
+Server.loop : Server.Config -> Optional Stdio.Child -> Nat ->{IO, Exception} ()
+Server.loop cfg child seq = match Exception.catch do getLine stdIn with
+  Left _ -> match child with
+    Some c -> Stdio.stop c
+    None -> ()
+  Right line ->
+    if Text.size (Text.trim line) == 0 then Server.loop cfg child seq
+    else Server.loop cfg (Server.onLine cfg child seq line) (seq + 1)
+
+-- Environment: UNISON_MCP_UCM (path of the `unison` binary of the pinned ucm), UNISON_MCP_CODEBASE
+-- (codebase directory), optional UNISON_MCP_PROJECT / UNISON_MCP_BRANCH (default main/main) and
+-- UNISON_MCP_TIMEOUT_MS (default 120000).
+Server.main : '{IO, Exception} ()
+Server.main = do
+  setBuffering stdOut NoBuffering
+  ucm = Server.env "UNISON_MCP_UCM" "ucm"
+  cb = Server.env "UNISON_MCP_CODEBASE" ""
+  cfg = Server.Config.Config ucm cb (Server.env "UNISON_MCP_PROJECT" "main") (Server.env "UNISON_MCP_BRANCH" "main") (Optional.getOrElse 120000 (Nat.fromText (Server.env "UNISON_MCP_TIMEOUT_MS" "120000")))
+  Server.loop cfg None 1
