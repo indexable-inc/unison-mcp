@@ -5,6 +5,7 @@
 # Needs network on the first run (lib.install from Unison Share).
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
+python3 -I "$here/scripts/gen-guide.py"   # docs/guide/*.md -> src/guide.u (embedded guide)
 cb="${1:?usage: build.sh CODEBASE_DIR [OUT.uc]}"
 out="${2:-}"
 ucm="${UNISON_MCP_UCM_DIR:-$HOME/.local/share/uni/ucm/release-1.5.0}/ucm"
