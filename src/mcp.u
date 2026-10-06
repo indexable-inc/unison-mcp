@@ -404,14 +404,14 @@ Mcp.handler = cases
 Mcp.run : '{Mcp, g} a ->{g, IO, Exception} a
 Mcp.run thunk = handle !thunk with Mcp.handler
 
-Mcp.fakeHandler : (Text -> Text -> Text -> Text) -> Request {Mcp} a -> a
+Mcp.fakeHandler : (Text -> Text -> Text -> Text) -> Request {Mcp, g} a ->{g} a
 Mcp.fakeHandler f = cases
   { a } -> a
   { Mcp.call n t x -> resume } -> handle resume (f n t x) with Mcp.fakeHandler f
   { Mcp.tools n -> resume } -> handle resume (f n "tools/list" "{}") with Mcp.fakeHandler f
 
 -- test double: f server tool args
-Mcp.fake : (Text -> Text -> Text -> Text) -> '{Mcp} a -> a
+Mcp.fake : (Text -> Text -> Text -> Text) -> '{Mcp, g} a ->{g} a
 Mcp.fake f thunk = handle !thunk with Mcp.fakeHandler f
 
 -- tool names out of a tools/list result text
@@ -419,6 +419,14 @@ Mcp.names : Text ->{Exception} [Text]
 Mcp.names t = match Mcp.jget "tools" (Json.fromText t) with
   Some (Json.Array ts) -> List.filterMap (Mcp.jgetText "name") ts
   _ -> []
+
+-- tool names only (a tools/list result can be tens of thousands of characters)
+Mcp.toolNames : Text ->{Mcp, Exception} [Text]
+Mcp.toolNames server = Mcp.names (Mcp.tools server)
+
+test> Mcp.tests.toolNames =
+  r = Exception.catch do Mcp.fake (n t x -> "{\"tools\":[{\"name\":\"a\",\"description\":\"long\"},{\"name\":\"b\"}]}") do Mcp.toolNames "srv"
+  check (r === Right ["a", "b"])
 
 test> Mcp.tests.fake =
   r = Mcp.fake (n t x -> n ++ ":" ++ t ++ ":" ++ x) do Mcp.call "srv" "echo" "{\"a\":1}"
