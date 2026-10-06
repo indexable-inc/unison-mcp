@@ -33,19 +33,12 @@ Server.toolName = "unison"
 
 Server.description : Text
 Server.description = Text.join "\n" [
-  "This is the user's general REPL and MCP client as well as the Unison tool. One call runs Unison (ucm 1.5) code on the local codebase (project/branch default main/main). Anything below is done by running a Unison cell with action 'run' (code = the body of a do block); do NOT conclude that Unison cannot do it.",
-  "Capabilities, each with a one-line cell:",
-  "  MCP client for any server (stdio or streamable HTTP, OAuth sign-in with a browser pop-up, token refresh, e.g. Superhuman): servers are listed in ~/.local/share/uni/mcp/servers.json. Sign in: Mcp.login \"superhuman\". Call: Mcp.run do Mcp.call \"superhuman\" \"list_threads\" \"{\\\"limit\\\":3}\" . Typed Superhuman wrappers: Mcp.run do Superhuman.listThreads 3. List tools: Mcp.run do Mcp.tools \"superhuman\".",
-  "  Chrome over CDP (the user's signed-in browser at http://127.0.0.1:9222, Cdp.endpoint): Cdp.connect Cdp.endpoint \"github.com\" do !Cdp.readPage (find or open a tab, return its text). Also Cdp.navigate url, Cdp.eval js, Cdp.waitFor (Cdp.Wait.Selector \"#id\") 5000, Cdp.click selector, Cdp.typeText selector text, Cdp.screenshot path, Cdp.targets Cdp.endpoint. Commands: Cdp.call \"Page.reload\" \"{}\".",
-  "  Processes: (i, o, e, p) = Process.start \"git\" [\"status\", \"-s\"]  then getText o  (Process.wait p gives the exit code). Files: readFileUtf8 (FilePath \"/abs/path\"), writeFileUtf8 (FilePath \"/abs/path\") text. HTTP: Threads.run do Http.run do HttpResponse.bodyText (Http.get (URI.parse \"https://example.com\")).",
-  "  Writing and testing Unison itself: check, update, view, search, tests and the other actions below.",
-  "Compile errors are DATA: the reply starts with 'stage:', 'ok:' and 'class:' (wrong-name, ambiguous-name, type-mismatch, unhandled-ability, parse-error, timeout, child-died, none). The exit status is never the verdict.",
-  "Actions (input 'action'; default 'check' when only 'code' is given):",
-  "  check: typecheck 'code'; lines starting with '> expr' are evaluated (pure) and 'test> name = check (..)' are run. Nothing is saved.",
-  "  run: with 'name' run that definition ('args' are its arguments); with 'code' and no 'name' the code is the BODY of a do block of type '{IO, Exception} a, run and discarded; with both, code is updated into the codebase and then 'name' is run.",
-  "  update: typecheck and write 'code' into the codebase (nothing is written on error). view: source of definitions in 'name' (space or comma separated). search: find definitions by name ('name'). type-search: by type ('name' or 'code', e.g. [a] -> Nat). install: lib.install the Share project in 'name' (@unison/base; optional args[0] = branch). docs: docs for 'name'. tests: run tests in subnamespace 'name' (empty = project). diff: preview an update of 'code'. guide: the full Unison language guide (read it once before writing non-trivial code). tools: list the underlying ucm tools. tool: call one underlying ucm tool by 'name' with 'json' arguments (projectContext is added when missing).",
-  "Other inputs: timeout_ms (per call, default 120000; on timeout the ucm child is killed and restarts on the next call), project, branch.",
-  "Traps: look up every library name first with action 'search' (guessed names were the top error); named functions are never infix (write Nat.mod a b, never a Nat.mod b; only symbolic operators like + == ++ are infix); higher-order functions take the function first (List.foreach printLine xs); == is per type, lists need === or List.equals; effects need the right abilities (main : '{IO, Exception} ()); a program that needs IO is run with action 'run', not 'check'; give each program a unique name since run can pick an older committed one; ucm exits 0 even on compile errors, so read 'ok:'."]
+  "Unison REPL, general MCP client and Chrome driver. Action 'run' executes Unison (ucm 1.5) code in a local codebase (code = the body of a do block of type '{IO, Exception} a), so everything below is a one-line cell; never conclude Unison cannot do it.",
+  "Cells: MCP client for any server in ~/.local/share/uni/mcp/servers.json (stdio or HTTP, OAuth sign-in with a browser pop-up): Mcp.login \"x\" ; Mcp.run do Mcp.call \"x\" \"tool\" \"{\\\"k\\\":1}\" ; Mcp.run do Mcp.toolNames \"x\". Chrome over CDP: Cdp.connect Cdp.endpoint \"github.com\" do !Cdp.readPage (also Cdp.navigate, eval, click, typeText, screenshot). Processes: (i, o, e, p) = Process.start \"git\" [\"status\"] then getText o. HTTP: Threads.run do Http.run do HttpResponse.bodyText (Http.get (URI.parse \"https://example.com\")).",
+  "Actions: check (default: typecheck 'code'; '> expr' and 'test>' lines run), run (code; or 'name' of a committed definition with 'args'; code that has definitions ends with one '> expr' line), update, view, search, type-search, install, docs, tests, diff, guide, tools, tool (raw ucm tool: 'name', 'json').",
+  "Replies start with 'stage:', 'ok:', 'class:' (wrong-name, ambiguous-name, type-mismatch, unhandled-ability, parse-error, usage, timeout, child-died, none). A result over ~12k characters is cut to head and tail; the full text is in a file whose path is returned.",
+  "Traps: (1) look up library names first with action 'search'; guessing is the top error. (2) Named functions are never infix: Nat.mod a b. (3) Function first: List.foreach printLine xs. (4) Compile errors are data and ucm exits 0 anyway: read 'ok:'. (5) Give each program a unique name; run can pick an older committed one.",
+  "Action 'guide' (optional 'topic': unison-basics, http-json, mcp-client, oauth, cdp, process-ffi, traps) returns the full cheat sheet."]
 
 Server.schema : Json
 Server.schema =
@@ -56,6 +49,7 @@ Server.schema =
     ("properties", Json.Object [
       ("code", str "Unison source (check, update, diff, type-search) or the body of a do block (run without name)."),
       ("action", Json.Object [("type", Json.Text "string"), ("enum", actions), ("description", Json.Text "What to do; default check.")]),
+      ("topic", str "For action guide: unison-basics, http-json, mcp-client, oauth, cdp, process-ffi, traps (default: index plus unison-basics and traps)."),
       ("name", str "Definition name(s), search query, library project, tests subnamespace or raw tool name, depending on action."),
       ("args", Json.Object [("type", Json.Text "array"), ("items", Json.Object [("type", Json.Text "string")]), ("description", Json.Text "Arguments of the run main function, or [branch] for install.")]),
       ("json", str "Raw JSON arguments for action tool."),
@@ -142,6 +136,93 @@ Server.indent code = Text.join "\n" (List.map (l -> "  " ++ l) (Text.lines code)
 Server.cellName : Text
 Server.cellName = "scratch.mcpCell"
 
+-- ---------- guide ----------
+
+Server.topicBody : Text -> Text
+Server.topicBody t = match List.find (cases (n, _) -> n == t) Guide.topics with
+  Some (_, b) -> b
+  None -> ""
+
+Server.guideDefault : Text
+Server.guideDefault =
+  Server.header "guide" true "none" ++ "Topics (call action 'guide' with 'topic'): " ++ Text.join ", " (List.map (cases (n, _) -> n) Guide.topics) ++ ", language (ucm's own language guide).\n\n" ++ Server.topicBody "unison-basics" ++ "\n\n" ++ Server.topicBody "traps"
+
+-- ---------- run cells with definitions ----------
+
+Server.dropBlank : [Text] -> [Text]
+Server.dropBlank = cases
+  [] -> []
+  h +: t -> if Text.size (Text.trim h) == 0 then Server.dropBlank t else h +: t
+
+Server.tokens : Text -> [Text]
+Server.tokens l = List.filter (s -> Text.size s > 0) (Text.split ?\s l)
+
+Server.col0 : Text -> Boolean
+Server.col0 l = Text.size l > 0 && not (Text.startsWith " " l) && not (Text.startsWith "\t" l)
+
+-- a top-level type signature or declaration line (a do-block body has none)
+Server.isDefLine : Text -> Boolean
+Server.isDefLine l =
+  if not (Server.col0 l) then false
+  else
+    toks = Server.tokens l
+    first = Optional.getOrElse "" (List.head toks)
+    second = Optional.getOrElse "" (List.head (List.drop 1 toks))
+    if first === "type" || first === "unique" || first === "structural" || first === "ability" then true
+    else second === ":" && not (Text.startsWith ">" l)
+
+-- Some (definitions, final expression) when the cell is a program: it has definitions and ends with `> expr` or a bare expression
+Server.splitProgram : Text -> Optional (Text, Text)
+Server.splitProgram code =
+  ls = Text.lines code
+  if List.find Server.isDefLine ls === None then None
+  else match List.reverse (Server.dropBlank (List.reverse ls)) with
+    [] -> None
+    all ->
+      lastLine = Optional.getOrElse "" (List.last all)
+      body = Text.join "\n" (List.take (List.size all - 1) all)
+      if Text.startsWith "> " lastLine then Some (body, Text.drop 2 lastLine)
+      else if Server.col0 lastLine && not (Text.startsWith "--" lastLine) && not (Text.startsWith "test>" lastLine) && not (Text.contains " = " lastLine) && not (Server.isDefLine lastLine) then Some (body, lastLine)
+      else None
+
+Server.progNs : Text
+Server.progNs = "scratch.mcpRun"
+
+Server.progEntry : Text
+Server.progEntry = "scratch.mcpRun.mcpEntry"
+
+-- ---------- big results ----------
+
+Server.capChars : Nat
+Server.capChars = 12000
+
+Server.stamp : '{IO, Exception} Text
+Server.stamp = do
+  (i, o, e, p) = Process.start "date" ["+%Y%m%dT%H%M%S"]
+  t = Text.trim (getText o)
+  _ = Process.wait p
+  t
+
+-- keep a reply under capChars: head and tail, the full text in a file under ~/.local/share/uni/spill
+Server.cap : Nat -> Text ->{IO} Text
+Server.cap seq t =
+  if Text.size t <= Server.capChars then t
+  else
+    n = Text.size t
+    head = Text.take 7000 t
+    tail = Text.drop (n - 4000) t
+    spill = do
+      dir = IO.getEnv "HOME" ++ "/.local/share/uni/spill"
+      (i, o, e, p) = Process.start "mkdir" ["-p", dir]
+      _ = Process.wait p
+      path = dir ++ "/" ++ !Server.stamp ++ "-" ++ Nat.toText seq ++ ".txt"
+      writeFileUtf8 (FilePath path) t
+      path
+    note = match Exception.catch spill with
+      Right path -> "full text (" ++ Nat.toText n ++ " characters) in file: " ++ path
+      Left f -> "full text not saved (" ++ Jx.message f ++ ")"
+    head ++ "\n\n[... cut, " ++ note ++ " ...]\n\n" ++ tail
+
 -- run one tool and format it
 Server.step : Text -> Stdio.Child -> Nat -> Nat -> Text -> Json ->{IO} Either Stdio.Error (Boolean, Text)
 Server.step stage c ms id tool arguments = match Server.callTool c ms id tool arguments with
@@ -193,7 +274,20 @@ Server.act cfg c seq args =
           Left e -> Left e
           Right (false, t) -> Right t
           Right (true, _) -> fin (runName n)
-        (None, Some body) ->
+        (None, Some body) -> match Server.splitProgram body with
+         Some (defs, expr) ->
+          cell = "namespace " ++ Server.progNs ++ "\n\n" ++ defs ++ "\n\nmcpEntry = do\n" ++ Server.indent expr ++ "\n"
+          match Server.step "update" c ms base "update-definitions" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text cell)])]) with
+            Left e -> Left e
+            Right (false, t) -> Right t
+            Right (true, _) ->
+              r = runName Server.progEntry
+              match r with
+                Left e -> Left e
+                Right _ ->
+                  _ = Server.callTool c 30000 (base + 4) "delete-definitions" (Json.Object [("projectContext", pc), ("names", Json.Array [Json.Text Server.progEntry]), ("force", Json.Boolean true)])
+                  fin r
+         None ->
           cell = Server.cellName ++ " = do\n" ++ Server.indent body ++ "\n"
           match Server.step "update" c ms base "update-definitions" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text cell)])]) with
             Left e -> Left e
@@ -235,11 +329,16 @@ Server.act cfg c seq args =
         Some n -> Json.Text n
         None -> Json.Null
       fin (Server.step "tests" c ms base "run-tests" (Json.Object [("projectContext", pc), ("subnamespace", sub)]))
-    "guide" -> match Stdio.call c ms (Json.nat base) "resources/read" (Json.Object [("uri", Json.Text "file://unison-guide")]) with
-      Left e -> Left e
-      Right r -> match Jx.get "contents" r with
-        Some (Json.Array items) -> Right (Text.join "\n" (List.filterMap (Jx.getText "text") items))
-        _ -> Right (Json.toText r)
+    "guide" -> match Jx.getText "topic" args with
+      None -> Right (Server.guideDefault)
+      Some "language" -> match Stdio.call c ms (Json.nat base) "resources/read" (Json.Object [("uri", Json.Text "file://unison-guide")]) with
+        Left e -> Left e
+        Right r -> match Jx.get "contents" r with
+          Some (Json.Array items) -> Right (Text.join "\n" (List.filterMap (Jx.getText "text") items))
+          _ -> Right (Json.toText r)
+      Some t -> match List.find (cases (n, _) -> n == t) Guide.topics with
+        Some (_, body) -> Right (Server.header "guide" true "none" ++ body)
+        None -> usage ("unknown topic '" ++ t ++ "'; topics: " ++ Text.join ", " (List.map (cases (n, _) -> n) Guide.topics) ++ ", language")
     "tools" -> match Stdio.call c ms (Json.nat base) "tools/list" (Json.Object []) with
       Left e -> Left e
       Right r -> match Jx.get "tools" r with
@@ -285,7 +384,7 @@ Server.exec cfg child seq args =
       Left e ->
         Stdio.stop c
         (Server.Out.Out true (Server.failText ms e), None)
-      Right text -> (Server.Out.Out false text, Some c)
+      Right text -> (Server.Out.Out false (Server.cap seq text), Some c)
 
 -- ---------- JSON-RPC server ----------
 
