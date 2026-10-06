@@ -23,7 +23,7 @@ Claude Code --stdio--> bin/unison-mcp (launcher, own process group)
    `scripts/install-ucm.sh` (downloads, checks the tarball and the two executed files, extracts to `~/.local/share/uni/ucm/release-1.5.0`).
 2. A codebase with project `main`, branch `main`, and the libraries `@unison/base` 7.19.2, `@unison/http` 16.1.0, `@unison/json` 1.4.2:
    `scripts/build.sh ~/.local/share/uni/codebase` creates it on first use (needs network once).
-3. `scripts/install.sh` loads the repo into the codebase (`--codebase DIR` for another one, `--migrate-old` to replace the earlier in-codebase `Mcp`/`Superhuman` definitions), compiles `Server.main` and installs the launcher as `~/.local/share/uni/unison-mcp` next to `unison-mcp.uc` and `ucm.pin`. It refuses while another ucm holds the codebase.
+3. `scripts/install.sh` loads the repo into the codebase (`--codebase DIR` for another one, `--migrate-old` to replace the earlier in-codebase `Mcp`/`Superhuman` definitions), compiles `Server.main` and installs the launcher as `~/.local/share/uni/unison-mcp` next to `unison-mcp.uc` and `ucm.pin`. It refuses while another ucm holds the codebase, and afterwards runs `scripts/verify-install.sh` (Cdp.connect, Mcp.toolNames, Server.main and Jx.get must be searchable in main/main: cells see the codebase, not the compiled `.uc`). `--dest DIR` installs the launcher elsewhere.
 4. Claude Code: `claude mcp add unison -- ~/.local/share/uni/unison-mcp`
 
 The launcher checks `unison/unison` against `ucm.pin` on every start (`UNISON_MCP_SKIP_PIN_CHECK=1` skips), runs the server in its own process group, and kills that whole group when stdin closes or on SIGTERM/SIGHUP/SIGINT.
@@ -40,6 +40,7 @@ Environment: `UNISON_MCP_CODEBASE` (default `~/.local/share/uni/codebase`), `UNI
 | `action` | `check` (default), `run`, `update`, `view`, `search`, `type-search`, `install`, `docs`, `tests`, `diff`, `guide`, `tools`, `tool` |
 | `name` | definition(s), search query, library project, tests subnamespace or raw ucm tool name, by action |
 | `args` | arguments of the run main function, or `[branch]` for `install` |
+| `topic` | for `guide`: unison-basics, http-json, mcp-client, oauth, cdp, process-ffi, traps (text in `docs/guide/*.md`, embedded into the build by `scripts/gen-guide.py` as `src/guide.u`) |
 | `json` | raw JSON arguments for `action: "tool"` (any ucm tool; `projectContext` is added when missing) |
 | `timeout_ms` | per call, default 120000; on timeout the ucm child is killed and restarts on the next call |
 | `project`, `branch` | default `main`, `main` |
@@ -51,6 +52,10 @@ stage: typecheck        # typecheck | run | update | view | search | ... | uniso
 ok: false
 class: type-mismatch    # none | wrong-name | ambiguous-name | type-mismatch | unhandled-ability | parse-error | timeout | child-died | rpc-error | usage | error
 ```
+
+A reply longer than about 12,000 characters is cut to head and tail; the full text is written to `~/.local/share/uni/spill/<time>-<n>.txt` and its path is in the reply. `Mcp.toolNames server` lists tool names only.
+
+A `run` cell whose code has definitions (a type signature or `type`/`ability` line) and ends with a `> expr` line or a bare expression is loaded under `scratch.mcpRun` and the expression is run.
 
 Compile errors are data: `isError` is false and `ok: false` carries the verdict (ucm itself exits 0 on compile errors). `isError` is true only for infrastructure failures (timeout, dead child).
 

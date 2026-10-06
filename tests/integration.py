@@ -106,9 +106,10 @@ class Protocol(Base):
         self.assertEqual([t["name"] for t in tools], ["unison"])
         self.assertIn("action", tools[0]["inputSchema"]["properties"])
         d = tools[0]["description"]
-        for needle in ("MCP client", "Cdp.connect", "OAuth", "look up every library name"):
+        for needle in ("MCP client", "Cdp.connect", "OAuth", "look up library names first", "Mcp.toolNames", "guide"):
             self.assertIn(needle, d)
         self.assertIn("infix", d)
+        self.assertLess(len(d), 1800, "the description is paid in every session")
 
     def test_unknown_tool_and_method(self):
         r = self.c.rpc("tools/call", {"name": "typecheck-code", "arguments": {}})
@@ -152,11 +153,95 @@ class Unison(Base):
         self.assertIn("Cdp.eval", self.c.tool(action="view", name="Cdp.eval")[1])
         self.assertIn("passing", self.c.tool(action="tests", name="Mcp")[1])
         self.assertIn("passing", self.c.tool(action="tests", name="Cdp")[1])
-        self.assertGreater(len(self.c.tool(action="guide")[1]), 5000)
+        self.assertGreater(len(self.c.tool(action="guide")[1]), 3000)
         self.assertIn("typecheck-code", self.c.tool(action="tools")[1])
+
+    def test_guide_topics(self):
+        topics = ["unison-basics", "http-json", "mcp-client", "oauth", "cdp", "process-ffi", "traps"]
+        listed = self.c.rpc("tools/list")["result"]["tools"][0]["description"]
+        for t in topics:
+            self.assertIn(t, listed)
+            err, text = self.c.tool(action="guide", topic=t)
+            self.assertFalse(err)
+            self.assertIn("ok: true", text, t)
+            self.assertIn("# " + t + ":", text)
+            self.assertGreater(len(text), 500)
+            self.assertNotIn("/Users/", text)
+        # the default guide is the index plus the basics and the traps
+        err, text = self.c.tool(action="guide")
+        self.assertIn("Topics (call action", text)
+        # unknown topic is an error class, not a crash; positive control above
+        err, text = self.c.tool(action="guide", topic="nope")
+        self.assertIn("ok: false", text)
+        self.assertIn("class: usage", text)
+        self.assertIn("unknown topic 'nope'", text)
+
+    def test_repo_names_are_searchable_and_callable(self):
+        # bug: Cdp.* was in the compiled server but not in the codebase cells see
+        for name in ("Cdp.connect", "Cdp.targets", "Mcp.toolNames", "Mcp.run", "Superhuman.listThreads"):
+            self.assertIn(name, self.c.tool(action="search", name=name)[1], name)
+        code = 'f : \'{IO, Exception} [Cdp.Target]\nf = do Cdp.targets "http://127.0.0.1:1"\n'
+        err, text = self.c.tool(action="check", code=code)
+        self.assertIn("ok: true", text, text)
+
+    def test_run_cell_with_definitions_and_trailing_expression(self):
+        for last in ("> double 21", "double 21"):
+            code = "double : Nat -> Nat\ndouble n = n * 2\n\n" + last
+            err, text = self.c.tool(action="run", code=code)
+            self.assertIn("ok: true", text, text)
+            self.assertTrue(text.rstrip().endswith("42"), text)
+        # positive control: a plain body with bindings still runs as a body
+        err, text = self.c.tool(action="run", code="x = 20\nx + 1")
+        self.assertTrue(text.rstrip().endswith("21"), text)
+        # definitions without a final expression are a usage error, not a parse error
+        err, text = self.c.tool(action="run", code="g : Nat\ng = 1")
+        self.assertIn("ok: false", text)
+
+    def test_big_result_is_cut_and_spilled_to_a_file(self):
+        err, small = self.c.tool(action="run", code='Text.join "" (List.replicate 100 do "ab")')
+        self.assertNotIn("cut,", small)
+        err, text = self.c.tool(action="run", code='Text.join "" (List.replicate 30000 do "ab")')
+        self.assertFalse(err)
+        self.assertLess(len(text), 13000)
+        self.assertIn("ok: true", text)
+        self.assertIn("cut, full text (", text)
+        path = text.split("in file: ", 1)[1].split(" ...]", 1)[0].strip()
+        self.assertTrue(path.endswith(".txt") and "/spill/" in path, path)
+        full = open(path).read()
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        self.assertGreaterEqual(len(full), 60000)
+        self.assertIn("ababab", full)
+
+    def test_mcp_tool_names(self):
+        self.assertIn("passing", self.c.tool(action="tests", name="Mcp")[1])
+        code = 'Exception.catch do Mcp.fake (n t x -> "{\\"tools\\":[{\\"name\\":\\"a\\"},{\\"name\\":\\"b\\"}]}") do Mcp.toolNames "s"'
+        err, text = self.c.tool(action="run", code=code)
+        self.assertIn("ok: true", text, text)
+        self.assertIn('"a"', text)
 
     def test_superhuman_example_fake(self):
         self.assertIn("passing", self.c.tool(action="tests", name="Superhuman")[1])
+
+
+class Install(unittest.TestCase):
+    def test_install_puts_repo_definitions_in_the_codebase(self):
+        """install.sh into a throwaway codebase and dest; it verifies Cdp.connect etc. in main/main itself."""
+        d = os.path.join(TEST_DIR, "install")
+        subprocess.run(["rm", "-rf", d], check=True)
+        r = subprocess.run([os.path.join(REPO, "scripts/install.sh"), "--codebase", os.path.join(d, "cb"), "--dest", os.path.join(d, "dest")],
+                           capture_output=True, text=True, env=dict(os.environ, UNISON_MCP_UCM_DIR=UCM_DIR))
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:] + r.stderr[-2000:])
+        self.assertIn("verified Cdp.connect", r.stdout)
+        for f in ("unison-mcp", "unison-mcp.uc", "ucm.pin"):
+            self.assertTrue(os.path.exists(os.path.join(d, "dest", f)), f)
+        # negative control: a codebase without the repo must make the same check fail
+        empty = os.path.join(d, "empty")
+        t = os.path.join(d, "v.md")
+        open(t, "w").write("```ucm\nscratch/main> project.create-empty main\n```\n")
+        subprocess.run([os.path.join(UCM_DIR, "ucm"), "-C", empty, "transcript.in-place", t], capture_output=True)
+        r2 = subprocess.run([os.path.join(REPO, "scripts/verify-install.sh"), empty], capture_output=True, text=True,
+                            env=dict(os.environ, UNISON_MCP_UCM_DIR=UCM_DIR))
+        self.assertNotEqual(r2.returncode, 0, r2.stdout + r2.stderr)
 
 
 class Supervision(Base):
