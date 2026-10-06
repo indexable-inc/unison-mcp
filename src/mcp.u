@@ -1,0 +1,425 @@
+-- Mcp: a generic Model Context Protocol client (streamable HTTP with OAuth, or stdio), in Unison.
+-- Servers are configured in ~/.local/share/uni/mcp/servers.json; nothing here is specific to one vendor.
+
+
+Mcp.hex : Nat -> Text
+Mcp.hex n = Text.take 1 (Text.drop n "0123456789ABCDEF")
+
+Mcp.pct : Text -> Text
+Mcp.pct t =
+  safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+  enc c =
+    if Text.contains (Char.toText c) safe then Char.toText c
+    else
+      n = Char.toNat c
+      "%" ++ Mcp.hex (n / 16) ++ Mcp.hex (Nat.mod n 16)
+  Text.join "" (List.map enc (Text.toCharList t))
+
+Mcp.form : [(Text, Text)] -> Text
+Mcp.form kvs = Text.join "&" (List.map (cases (k, v) -> k ++ "=" ++ Mcp.pct v) kvs)
+
+Mcp.jget : Text -> Json -> Optional Json
+Mcp.jget k = cases
+  Json.Object kvs -> match List.find (cases (n, _) -> n == k) kvs with
+    Some (_, v) -> Some v
+    None -> None
+  _ -> None
+
+Mcp.jtext : Json -> Optional Text
+Mcp.jtext = cases
+  Json.Text t -> Some t
+  _ -> None
+
+Mcp.jgetText : Text -> Json -> Optional Text
+Mcp.jgetText k j = match Mcp.jget k j with
+  Some v -> Mcp.jtext v
+  None -> None
+
+Mcp.need : Text -> Optional a ->{Exception} a
+Mcp.need what = cases
+  Some a -> a
+  None -> Exception.raiseGeneric ("missing " ++ what) what
+
+-- state file: ~/.local/share/uni/mcp/<name>.json, mode 0600, never printed
+Mcp.dir : '{IO, Exception} Text
+Mcp.dir = do IO.getEnv "HOME" ++ "/.local/share/uni/mcp"
+
+Mcp.statePath : Mcp.Server ->{IO, Exception} Text
+Mcp.statePath s = !Mcp.dir ++ "/" ++ Mcp.Server.name s ++ ".json"
+
+Mcp.runCmd : Text -> [Text] ->{IO, Exception} ()
+Mcp.runCmd cmd args =
+  (hin, hout, herr, proc) = Process.start cmd args
+  _ = Process.wait proc
+  ()
+
+Mcp.loadState : Mcp.Server ->{IO, Exception} Json
+Mcp.loadState s =
+  p = FilePath (Mcp.statePath s)
+  if FilePath.exists p then Json.fromText (readFileUtf8 p) else Json.Object []
+
+Mcp.saveState : Mcp.Server -> Json ->{IO, Exception} ()
+Mcp.saveState s j =
+  Mcp.runCmd "mkdir" ["-p", "-m", "700", !Mcp.dir]
+  path = Mcp.statePath s
+  Mcp.runCmd "install" ["-m", "600", "/dev/null", path]
+  writeFileUtf8 (FilePath path) (Json.toText j)
+
+Mcp.setKeys : Mcp.Server -> [(Text, Json)] ->{IO, Exception} ()
+Mcp.setKeys s kvs =
+  old = match Mcp.loadState s with
+    Json.Object o -> o
+    _ -> []
+  keep = List.filter (cases (k, _) -> match List.find (cases (k2, _) -> k2 == k) kvs with
+    Some _ -> false
+    None -> true) old
+  Mcp.saveState s (Json.Object (keep List.++ kvs))
+
+-- raw HTTP: (status, body text, session-id header if any)
+Mcp.http : Text -> [(Text, Text)] -> Text ->{IO, Exception} (Nat, Text, Optional Text)
+Mcp.http url hdrs body =
+  Threads.run do
+    Http.run do
+      req0 = HttpRequest.post (URI.parse url) (Body.fromText body)
+      req = List.foldLeft (r h -> match h with (k, v) -> HttpRequest.setHeader k [v] r) req0 hdrs
+      resp = Http.request req
+      sid = List.head (Headers.getValues "mcp-session-id" (HttpResponse.headers resp))
+      (Status.code (HttpResponse.status resp), HttpResponse.bodyText resp, sid)
+
+
+unique type Mcp.Transport = Remote Text | Local Text [Text]
+unique type Mcp.Auth = NoAuth | Header Text Text | BearerEnv Text | OAuth
+unique type Mcp.Server = { name : Text, transport : Mcp.Transport, auth : Mcp.Auth }
+
+ability Mcp where
+  call : Text -> Text -> Text ->{Mcp} Text
+  tools : Text ->{Mcp} Text
+
+Mcp.scope : Text
+Mcp.scope = "email offline_access openid profile"
+
+Mcp.formCt : Text
+Mcp.formCt = "application/x-www-form-urlencoded"
+
+Mcp.openUrl : Text ->{IO, Exception} ()
+Mcp.openUrl url = Mcp.runCmd "open" [url]
+
+Mcp.b64url : Bytes -> Text
+Mcp.b64url b = Text.fromUtf8 (Bytes.toBase64UrlUnpadded b)
+
+-- ---------- config ----------
+Mcp.fromConfig : Text -> Json ->{Exception} Mcp.Server
+Mcp.fromConfig name j =
+  transport = match Mcp.jgetText "url" j with
+    Some u -> Mcp.Transport.Remote u
+    None ->
+      args = match Mcp.jget "args" j with
+        Some (Json.Array xs) -> List.filterMap Mcp.jtext xs
+        _ -> []
+      Mcp.Transport.Local (Mcp.need "command" (Mcp.jgetText "command" j)) args
+  auth = match Mcp.jgetText "auth" j with
+    Some "oauth" -> Mcp.Auth.OAuth
+    Some a | Text.startsWith "bearer-env:" a -> Mcp.Auth.BearerEnv (Text.drop 11 a)
+    _ -> Mcp.Auth.NoAuth
+  Mcp.Server.Server name transport auth
+
+-- servers come from ~/.local/share/uni/mcp/servers.json:
+-- {"name": {"url": "https://..", "auth": "oauth" | "bearer-env:VAR"} or {"command": "npx", "args": [..]}}
+Mcp.lookup : Text ->{IO, Exception} Mcp.Server
+Mcp.lookup name =
+  p = FilePath (!Mcp.dir ++ "/servers.json")
+  if FilePath.exists p then
+    Mcp.fromConfig name (Mcp.need ("server " ++ name) (Mcp.jget name (Json.fromText (readFileUtf8 p))))
+  else Exception.raiseGeneric ("unknown server " ++ name ++ " (no servers.json)") name
+
+-- ---------- OAuth discovery ----------
+Mcp.httpGet : Text ->{IO, Exception} (Nat, Text)
+Mcp.httpGet url =
+  Threads.run do
+    Http.run do
+      resp = Http.get (URI.parse url)
+      (Status.code (HttpResponse.status resp), HttpResponse.bodyText resp)
+
+Mcp.origin : Text -> Text
+Mcp.origin url = match Text.split ?/ url with
+  scheme +: (_ +: (host +: _)) -> scheme ++ "//" ++ host
+  _ -> url
+
+Mcp.firstOk : [Text] ->{IO, Exception} Optional Json
+Mcp.firstOk urls = match urls with
+  [] -> None
+  u +: rest -> match Mcp.httpGet u with
+    (200, b) -> Some (Json.fromText b)
+    _ -> Mcp.firstOk rest
+
+Mcp.remoteUrl : Mcp.Server ->{Exception} Text
+Mcp.remoteUrl s = match Mcp.Server.transport s with
+  Mcp.Transport.Remote u -> u
+  _ -> Exception.raiseGeneric "not a remote server" (Mcp.Server.name s)
+
+-- /.well-known/oauth-protected-resource then the authorization server's metadata
+Mcp.discover : Mcp.Server ->{IO, Exception} Json
+Mcp.discover s =
+  url = Mcp.remoteUrl s
+  o = Mcp.origin url
+  path = Text.drop (Text.size o) url
+  prm = Mcp.need "oauth-protected-resource" (Mcp.firstOk [o ++ "/.well-known/oauth-protected-resource" ++ path, o ++ "/.well-known/oauth-protected-resource"])
+  as = match Mcp.jget "authorization_servers" prm with
+    Some (Json.Array (Json.Text a +: _)) -> a
+    _ -> o
+  Mcp.need "authorization server metadata" (Mcp.firstOk [as ++ "/.well-known/oauth-authorization-server", as ++ "/.well-known/openid-configuration"])
+
+Mcp.endpoint : Text -> Json ->{Exception} Text
+Mcp.endpoint k meta = Mcp.need ("endpoint " ++ k) (Mcp.jgetText k meta)
+
+Mcp.advertises : Text -> Json -> Boolean
+Mcp.advertises k meta = match Mcp.jget k meta with
+  Some _ -> true
+  None -> false
+
+Mcp.authPost : Text -> Text -> Text ->{IO, Exception} Json
+Mcp.authPost url ct body =
+  (_, text, _) = Mcp.http url [("content-type", ct), ("accept", "application/json")] body
+  Json.fromText text
+
+-- dynamic client registration (once per server; client_id kept in the state file)
+Mcp.ensureClient : Mcp.Server -> Json ->{IO, Exception} Text
+Mcp.ensureClient s meta =
+  st = Mcp.loadState s
+  match Mcp.jgetText "client_id" st with
+    Some c -> c
+    None ->
+      reg = Json.toText (Json.Object [("client_name", Json.Text "unison-mcp"), ("redirect_uris", Json.Array [Json.Text "http://127.0.0.1:8976/callback"]), ("grant_types", Json.Array [Json.Text "authorization_code", Json.Text "refresh_token", Json.Text "urn:ietf:params:oauth:grant-type:device_code"]), ("response_types", Json.Array [Json.Text "code"]), ("token_endpoint_auth_method", Json.Text "none"), ("scope", Json.Text Mcp.scope)])
+      j = Mcp.authPost (Mcp.endpoint "registration_endpoint" meta) "application/json" reg
+      cid = Mcp.need "client_id" (Mcp.jgetText "client_id" j)
+      Mcp.setKeys s [("client_id", Json.Text cid)]
+      cid
+
+Mcp.storeTokens : Mcp.Server -> Json ->{IO, Exception} ()
+Mcp.storeTokens s j =
+  at = Mcp.need "access_token" (Mcp.jgetText "access_token" j)
+  rt = match Mcp.jgetText "refresh_token" j with
+    Some r -> [("refresh_token", Json.Text r)]
+    None -> []
+  Mcp.setKeys s ([("access_token", Json.Text at), ("device_code", Json.Null)] List.++ rt)
+
+Mcp.queryParam : Text -> Text -> Optional Text
+Mcp.queryParam key line =
+  target = match Text.split ?\s line with
+    [_, t, _] -> t
+    _ -> ""
+  q = match Text.split ?? target with
+    [_, q] -> q
+    _ -> ""
+  pairs = Text.split ?& q
+  List.head (List.filterMap (p -> match Text.split ?= p with
+    [k, v] -> if k == key then Some v else None
+    _ -> None) pairs)
+
+-- browser sign-in: authorization code + PKCE (S256), loopback redirect 127.0.0.1:8976, opens the URL with `open`
+Mcp.loginPkce : Mcp.Server -> Json ->{IO, Exception} Text
+Mcp.loginPkce s meta =
+  cid = Mcp.ensureClient s meta
+  verifier = Mcp.b64url (IO.randomBytes 32)
+  challenge = Mcp.b64url (crypto.hashBytes Sha2_256 (Text.toUtf8 verifier))
+  state = Mcp.b64url (IO.randomBytes 16)
+  redirect = "http://127.0.0.1:8976/callback"
+  url = Mcp.endpoint "authorization_endpoint" meta ++ "?" ++ Mcp.form [("response_type", "code"), ("client_id", cid), ("redirect_uri", redirect), ("scope", Mcp.scope), ("code_challenge", challenge), ("code_challenge_method", "S256"), ("state", state), ("resource", Mcp.remoteUrl s)]
+  listening = Socket.listen (Socket.server (Some (HostName "127.0.0.1")) (Port "8976"))
+  Mcp.openUrl url
+  conn = Socket.accept listening
+  req = Text.fromUtf8 (Socket.receive conn)
+  line = match List.head (Text.lines req) with
+    Some l -> l
+    None -> ""
+  Socket.send conn (Text.toUtf8 "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\ncontent-length: 27\r\n\r\nSigned in, close this tab.\n")
+  Socket.close conn
+  code = Mcp.need "code in redirect" (Mcp.queryParam "code" line)
+  if Mcp.queryParam "state" line === Some state then ()
+  else Exception.raiseGeneric "state mismatch" line
+  j = Mcp.authPost (Mcp.endpoint "token_endpoint" meta) Mcp.formCt (Mcp.form [("client_id", cid), ("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect), ("code_verifier", verifier)])
+  Mcp.storeTokens s j
+  "logged in; tokens saved to " ++ Mcp.statePath s
+
+-- device flow (RFC 8628): opens the verification URL, polls ~4 minutes
+Mcp.loginDevice : Mcp.Server -> Json ->{IO, Exception} Text
+Mcp.loginDevice s meta =
+  cid = Mcp.ensureClient s meta
+  j = Mcp.authPost (Mcp.endpoint "device_authorization_endpoint" meta) Mcp.formCt (Mcp.form [("client_id", cid), ("scope", Mcp.scope), ("resource", Mcp.remoteUrl s)])
+  dc = Mcp.need "device_code" (Mcp.jgetText "device_code" j)
+  url = Mcp.need "verification_uri_complete" (Mcp.jgetText "verification_uri_complete" j)
+  Mcp.openUrl url
+  tokenUrl = Mcp.endpoint "token_endpoint" meta
+  loop : Nat ->{IO, Exception} Text
+  loop n =
+    if n == 0 then "device sign-in not approved in time (" ++ url ++ ")"
+    else
+      t = Mcp.authPost tokenUrl Mcp.formCt (Mcp.form [("client_id", cid), ("device_code", dc), ("grant_type", "urn:ietf:params:oauth:grant-type:device_code")])
+      match Mcp.jgetText "access_token" t with
+        Some _ ->
+          Mcp.storeTokens s t
+          "logged in; tokens saved to " ++ Mcp.statePath s
+        None ->
+          err = match Mcp.jgetText "error" t with
+            Some e -> e
+            None -> "unknown"
+          if err == "authorization_pending" || err == "slow_down" then
+            sleepMicroseconds 5000000
+            loop (Nat.decrement n)
+          else Exception.raiseGeneric ("login failed: " ++ err) err
+  loop 48
+
+-- sign in to a server by name: picks PKCE when the server advertises an authorization endpoint, else the device flow
+Mcp.login : Text ->{IO, Exception} Text
+Mcp.login name =
+  s = Mcp.lookup name
+  match Mcp.Server.auth s with
+    Mcp.Auth.OAuth ->
+      meta = Mcp.discover s
+      if Mcp.advertises "authorization_endpoint" meta then Mcp.loginPkce s meta
+      else Mcp.loginDevice s meta
+    _ -> "server " ++ name ++ " needs no sign-in"
+
+Mcp.refresh : Mcp.Server ->{IO, Exception} Text
+Mcp.refresh s =
+  meta = Mcp.discover s
+  st = Mcp.loadState s
+  cid = Mcp.need "client_id" (Mcp.jgetText "client_id" st)
+  rt = Mcp.need "refresh_token (run Mcp.login)" (Mcp.jgetText "refresh_token" st)
+  j = Mcp.authPost (Mcp.endpoint "token_endpoint" meta) Mcp.formCt (Mcp.form [("client_id", cid), ("refresh_token", rt), ("grant_type", "refresh_token")])
+  Mcp.storeTokens s j
+  Mcp.need "access_token" (Mcp.jgetText "access_token" j)
+
+-- ---------- JSON-RPC ----------
+Mcp.rpcBody : Nat -> Text -> Json -> Text
+Mcp.rpcBody id method params =
+  Json.toText (Json.Object [("jsonrpc", Json.Text "2.0"), ("id", Json.nat id), ("method", Json.Text method), ("params", params)])
+
+Mcp.notifyBody : Text
+Mcp.notifyBody = Json.toText (Json.Object [("jsonrpc", Json.Text "2.0"), ("method", Json.Text "notifications/initialized")])
+
+Mcp.initParams : Json
+Mcp.initParams = Json.Object [("protocolVersion", Json.Text "2025-03-26"), ("capabilities", Json.Object []), ("clientInfo", Json.Object [("name", Json.Text "unison-mcp"), ("version", Json.Text "0.2")])]
+
+Mcp.result : Text -> Json ->{Exception} Json
+Mcp.result method j = match Mcp.jget "error" j with
+  Some e -> Exception.raiseGeneric ("mcp error: " ++ Json.toText e) method
+  None -> Mcp.need "result" (Mcp.jget "result" j)
+
+-- JSON or SSE ("data: {...}" lines) response body to the last JSON-RPC message
+Mcp.parseRpc : Text ->{Exception} Json
+Mcp.parseRpc body =
+  t = Text.trim body
+  if Text.startsWith "{" t then Json.fromText t
+  else
+    datas = List.filterMap (l -> if Text.startsWith "data:" l then Some (Text.trim (Text.drop 5 l)) else None) (Text.lines t)
+    match List.last datas with
+      Some d -> Json.fromText d
+      None -> Exception.raiseGeneric "no JSON-RPC message in response" (Text.take 200 t)
+
+Mcp.authHeaders : Mcp.Server -> Optional Text ->{IO, Exception} [(Text, Text)]
+Mcp.authHeaders s override = match Mcp.Server.auth s with
+  Mcp.Auth.NoAuth -> []
+  Mcp.Auth.Header k v -> [(k, v)]
+  Mcp.Auth.BearerEnv var -> [("authorization", "Bearer " ++ IO.getEnv var)]
+  Mcp.Auth.OAuth ->
+    token = match override with
+      Some t -> t
+      None -> Mcp.need "access_token (run Mcp.login)" (Mcp.jgetText "access_token" (Mcp.loadState s))
+    [("authorization", "Bearer " ++ token)]
+
+Mcp.headers : [(Text, Text)] -> Optional Text -> [(Text, Text)]
+Mcp.headers auth sid =
+  base = [("content-type", "application/json"), ("accept", "application/json, text/event-stream")] List.++ auth
+  match sid with
+    Some i -> base List.++ [("mcp-session-id", i)]
+    None -> base
+
+Mcp.isOAuth : Mcp.Server -> Boolean
+Mcp.isOAuth s = match Mcp.Server.auth s with
+  Mcp.Auth.OAuth -> true
+  _ -> false
+
+-- streamable HTTP: initialize (refresh token on 401), notifications/initialized, then k gets an rpc function
+Mcp.sessionHttp : Mcp.Server -> Text -> (( Text -> Json ->{IO, Exception} Json) ->{IO, Exception} a) ->{IO, Exception} a
+Mcp.sessionHttp s url k =
+  body = Mcp.rpcBody 1 "initialize" Mcp.initParams
+  (c0, x0, sid0) = Mcp.http url (Mcp.headers (Mcp.authHeaders s None) None) body
+  (override, code, text, sid) =
+    if c0 == 401 && Mcp.isOAuth s then
+      t1 = Mcp.refresh s
+      (c1, x1, s1) = Mcp.http url (Mcp.headers (Mcp.authHeaders s (Some t1)) None) body
+      (Some t1, c1, x1, s1)
+    else (None, c0, x0, sid0)
+  if code != 200 then Exception.raiseGeneric ("initialize failed: http " ++ Nat.toText code) (Text.take 200 text) else ()
+  hdrs = Mcp.headers (Mcp.authHeaders s override) sid
+  _ = Mcp.http url hdrs Mcp.notifyBody
+  rpc method params =
+    (c, b, _) = Mcp.http url hdrs (Mcp.rpcBody 2 method params)
+    if c != 200 then Exception.raiseGeneric ("http " ++ Nat.toText c) (Text.take 300 b) else ()
+    Mcp.result method (Mcp.parseRpc b)
+  k rpc
+
+-- stdio: newline-delimited JSON-RPC over a supervised child process (see Stdio)
+Mcp.sessionStdio : Text -> [Text] -> (( Text -> Json ->{IO, Exception} Json) ->{IO, Exception} a) ->{IO, Exception} a
+Mcp.sessionStdio cmd args k =
+  c = match Stdio.start cmd args 60000 with
+    Left e -> Exception.raiseGeneric ("cannot start " ++ cmd) (Stdio.Error.describe e)
+    Right c -> c
+  rpc method params = match Stdio.call c 120000 (Json.nat 2) method params with
+    Left e -> Exception.raiseGeneric (Stdio.Error.describe e) method
+    Right j -> j
+  r = Exception.catch do k rpc
+  Stdio.stop c
+  match r with
+    Left f -> Exception.raise f
+    Right a -> a
+
+Mcp.withSession : Mcp.Server -> (( Text -> Json ->{IO, Exception} Json) ->{IO, Exception} a) ->{IO, Exception} a
+Mcp.withSession s k = match Mcp.Server.transport s with
+  Mcp.Transport.Remote url -> Mcp.sessionHttp s url k
+  Mcp.Transport.Local cmd args -> Mcp.sessionStdio cmd args k
+
+-- ---------- IO implementation of the Mcp ability ----------
+Mcp.callIO : Mcp.Server -> Text -> Text ->{IO, Exception} Text
+Mcp.callIO s tool argsJson =
+  args = Json.fromText argsJson
+  go rpc =
+    r = rpc "tools/call" (Json.Object [("name", Json.Text tool), ("arguments", args)])
+    match Mcp.jget "content" r with
+      Some (Json.Array items) -> Text.join "\n" (List.filterMap (Mcp.jgetText "text") items)
+      _ -> Json.toText r
+  Mcp.withSession s go
+
+Mcp.toolsIO : Mcp.Server ->{IO, Exception} Text
+Mcp.toolsIO s = Mcp.withSession s (rpc -> Json.toText (rpc "tools/list" (Json.Object [])))
+
+Mcp.handler : Request {Mcp} a ->{IO, Exception} a
+Mcp.handler = cases
+  { a } -> a
+  { Mcp.call n t x -> resume } -> handle resume (Mcp.callIO (Mcp.lookup n) t x) with Mcp.handler
+  { Mcp.tools n -> resume } -> handle resume (Mcp.toolsIO (Mcp.lookup n)) with Mcp.handler
+
+-- run Mcp-ability code against the real servers
+Mcp.run : '{Mcp, g} a ->{g, IO, Exception} a
+Mcp.run thunk = handle !thunk with Mcp.handler
+
+Mcp.fakeHandler : (Text -> Text -> Text -> Text) -> Request {Mcp} a -> a
+Mcp.fakeHandler f = cases
+  { a } -> a
+  { Mcp.call n t x -> resume } -> handle resume (f n t x) with Mcp.fakeHandler f
+  { Mcp.tools n -> resume } -> handle resume (f n "tools/list" "{}") with Mcp.fakeHandler f
+
+-- test double: f server tool args
+Mcp.fake : (Text -> Text -> Text -> Text) -> '{Mcp} a -> a
+Mcp.fake f thunk = handle !thunk with Mcp.fakeHandler f
+
+-- tool names out of a tools/list result text
+Mcp.names : Text ->{Exception} [Text]
+Mcp.names t = match Mcp.jget "tools" (Json.fromText t) with
+  Some (Json.Array ts) -> List.filterMap (Mcp.jgetText "name") ts
+  _ -> []
+
+test> Mcp.tests.fake =
+  r = Mcp.fake (n t x -> n ++ ":" ++ t ++ ":" ++ x) do Mcp.call "srv" "echo" "{\"a\":1}"
+  check (r == "srv:echo:{\"a\":1}")

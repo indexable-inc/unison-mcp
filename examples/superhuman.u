@@ -1,0 +1,52 @@
+-- Example: Superhuman Mail through the generic Mcp client. Not part of the core.
+--
+-- 1. Register the server once in ~/.local/share/uni/mcp/servers.json:
+--      {"superhuman": {"url": "https://mcp.mail.superhuman.com/mcp", "auth": "oauth"}}
+-- 2. Sign in once (opens the browser; the token is stored 0600 under ~/.local/share/uni/mcp/):
+--      unison tool: action run, code: Mcp.login "superhuman"
+-- 3. Call tools:
+--      action run, code: Mcp.run do Superhuman.listThreads 3
+--      action run, code: Mcp.run do !Superhuman.toolNames
+-- Tool names and arguments are the server's own (list_threads, get_thread, create_or_update_draft ...).
+
+Superhuman.tool : Text -> Text ->{Mcp} Text
+Superhuman.tool name argsJson = Mcp.call "superhuman" name argsJson
+
+Superhuman.toolNames : '{Mcp, Exception} [Text]
+Superhuman.toolNames = do Mcp.names (Mcp.tools "superhuman")
+
+Superhuman.listThreads : Nat ->{Mcp} Text
+Superhuman.listThreads limit = Superhuman.tool "list_threads" ("{\"limit\":" ++ Nat.toText limit ++ "}")
+
+Superhuman.getThread : Text ->{Mcp} Text
+Superhuman.getThread threadId = Superhuman.tool "get_thread" (Json.toText (Json.Object [("thread_id", Json.Text threadId)]))
+
+Superhuman.getMessage : Text ->{Mcp} Text
+Superhuman.getMessage messageId = Superhuman.tool "get_message" (Json.toText (Json.Object [("message_id", Json.Text messageId)]))
+
+Superhuman.query : Text ->{Mcp} Text
+Superhuman.query question = Superhuman.tool "query_email_and_calendar" (Json.toText (Json.Object [("question", Json.Text question)]))
+
+Superhuman.listLabels : '{Mcp} Text
+Superhuman.listLabels = do Superhuman.tool "list_labels" "{}"
+
+Superhuman.listAccounts : '{Mcp} Text
+Superhuman.listAccounts = do Superhuman.tool "list_accounts" "{}"
+
+-- drafts and thread updates take the server's JSON arguments; nothing here sends mail
+Superhuman.draft : Text ->{Mcp} Text
+Superhuman.draft argsJson = Superhuman.tool "create_or_update_draft" argsJson
+
+Superhuman.updateThread : Text ->{Mcp} Text
+Superhuman.updateThread argsJson = Superhuman.tool "update_thread" argsJson
+
+test> Superhuman.tests.fake =
+  r = Mcp.fake (n t x -> n ++ ":" ++ t ++ ":" ++ x) do Superhuman.listThreads 3
+  check (r == "superhuman:list_threads:{\"limit\":3}")
+
+-- one-line proofs: action run, name Superhuman.proofNames / Superhuman.proofList
+Superhuman.proofNames : '{IO, Exception} [Text]
+Superhuman.proofNames = do Mcp.run do !Superhuman.toolNames
+
+Superhuman.proofList : '{IO, Exception} Text
+Superhuman.proofList = do Mcp.run do Superhuman.listThreads 3
