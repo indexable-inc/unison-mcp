@@ -1,0 +1,237 @@
+-- Cdp: first-class Chrome DevTools Protocol primitives (independent of the MCP modules).
+--
+--   Cdp.run wsUrl do ...          real handler over the @unison/http WebSocket client
+--   Cdp.connect base "substr" do  find (or open) a tab whose URL contains substr, then Cdp.run
+--   Cdp.fake f do ...             test double: f method paramsJson = full reply text
+--
+-- The browser endpoint defaults to http://127.0.0.1:9222 (Cdp.endpoint).
+
+ability Cdp where
+  -- send method paramsJson: the full reply message (text) with the matching id; events seen meanwhile are buffered
+  send : Text -> Text ->{Cdp} Text
+  -- take all buffered events (messages without an id) seen so far
+  drain : {Cdp} [Text]
+
+Cdp.endpoint : Text
+Cdp.endpoint = "http://127.0.0.1:9222"
+
+unique type Cdp.Target = Target Text Text Text Text Text
+
+Cdp.Target.id : Cdp.Target -> Text
+Cdp.Target.id = cases Cdp.Target.Target i _ _ _ _ -> i
+
+Cdp.Target.kind : Cdp.Target -> Text
+Cdp.Target.kind = cases Cdp.Target.Target _ k _ _ _ -> k
+
+Cdp.Target.url : Cdp.Target -> Text
+Cdp.Target.url = cases Cdp.Target.Target _ _ u _ _ -> u
+
+Cdp.Target.title : Cdp.Target -> Text
+Cdp.Target.title = cases Cdp.Target.Target _ _ _ t _ -> t
+
+Cdp.Target.wsUrl : Cdp.Target -> Text
+Cdp.Target.wsUrl = cases Cdp.Target.Target _ _ _ _ w -> w
+
+-- ---------- HTTP side: /json/list and /json/new ----------
+
+Cdp.httpGet : Text ->{IO, Exception} Text
+Cdp.httpGet url =
+  Threads.run do
+    Http.run do
+      HttpResponse.bodyText (Http.get (URI.parse url))
+
+Cdp.httpPut : Text ->{IO, Exception} Text
+Cdp.httpPut url =
+  Threads.run do
+    Http.run do
+      HttpResponse.bodyText (Http.request (HttpRequest.put (URI.parse url) (Body Bytes.empty)))
+
+Cdp.parseTarget : Json -> Optional Cdp.Target
+Cdp.parseTarget j = match Jx.getText "webSocketDebuggerUrl" j with
+  None -> None
+  Some w ->
+    f k = match Jx.getText k j with
+      Some v -> v
+      None -> ""
+    Some (Cdp.Target.Target (f "id") (f "type") (f "url") (f "title") w)
+
+-- every debuggable target (pages, workers, extensions) of the browser at `base`
+Cdp.targets : Text ->{IO, Exception} [Cdp.Target]
+Cdp.targets base = match Json.fromText (Cdp.httpGet (base ++ "/json/list")) with
+  Json.Array xs -> List.filterMap Cdp.parseTarget xs
+  _ -> []
+
+-- the first page whose URL contains `needle`; when there is none and `needle` is an
+-- http(s)/data/about URL, a new tab is opened on it
+Cdp.pageFor : Text -> Text ->{IO, Exception} Cdp.Target
+Cdp.pageFor base needle =
+  pages = List.filter (t -> Cdp.Target.kind t == "page") (Cdp.targets base)
+  match List.find (t -> Text.contains needle (Cdp.Target.url t)) pages with
+    Some t -> t
+    None ->
+      if Text.startsWith "http" needle || Text.startsWith "data:" needle || Text.startsWith "about:" needle then
+        _ = Cdp.httpPut (base ++ "/json/new?" ++ needle)
+        match List.find (t -> Text.contains needle (Cdp.Target.url t)) (List.filter (t -> Cdp.Target.kind t == "page") (Cdp.targets base)) with
+          Some t -> t
+          None -> Exception.raiseGeneric "opened a tab but it is not listed" needle
+      else Exception.raiseGeneric "no page matches" needle
+
+-- the WebSocket client only accepts http(s) schemes
+Cdp.httpScheme : Text -> Text
+Cdp.httpScheme u =
+  if Text.startsWith "ws://" u then "http://" ++ Text.drop 5 u
+  else if Text.startsWith "wss://" u then "https://" ++ Text.drop 6 u
+  else u
+
+-- ---------- real handler ----------
+
+Cdp.msgText : Message -> Text
+Cdp.msgText = cases
+  TextMessage t -> t
+  BinaryMessage _ -> "{}"
+
+-- send one request, read until its reply; other messages are kept as events
+Cdp.exchange : WebSocket -> Nat -> Text -> Text -> [Text] ->{Exception, WebSockets} (Text, [Text])
+Cdp.exchange ws id method params buf =
+  -- CDP is not JSON-RPC 2.0: no "jsonrpc" member
+  WebSockets.send ws (Message.text (Json.toText (Json.Object [("id", Json.nat id), ("method", Json.Text method), ("params", Json.fromText params)])))
+  Cdp.await ws id buf
+
+Cdp.await : WebSocket -> Nat -> [Text] ->{Exception, WebSockets} (Text, [Text])
+Cdp.await ws id buf =
+  t = Cdp.msgText (WebSockets.receive ws)
+  if Jx.get "id" (Json.fromText t) === Some (Json.nat id) then (t, buf)
+  else Cdp.await ws id (buf List.++ [t])
+
+Cdp.handler : WebSocket -> Nat -> [Text] -> Request {Cdp} a ->{Exception, WebSockets} a
+Cdp.handler ws next buf = cases
+  { a } -> a
+  { Cdp.send m p -> resume } ->
+    (reply, buf2) = Cdp.exchange ws next m p buf
+    handle resume reply with Cdp.handler ws (next + 1) buf2
+  { Cdp.drain -> resume } -> handle resume buf with Cdp.handler ws next []
+
+-- run Cdp code against one page target (its webSocketDebuggerUrl)
+Cdp.run : Text -> '{Cdp, IO, Exception} a ->{IO, Exception} a
+Cdp.run wsUrl thunk =
+  Threads.run do
+    req = HttpRequest.get (URI.parse (Cdp.httpScheme wsUrl))
+    socket = handle webSocket req with HttpWebSocket.ioHandler
+    WebSockets.runLocal do
+      handle !thunk with Cdp.handler socket 1 []
+
+-- find or open a tab (see pageFor), then run
+Cdp.connect : Text -> Text -> '{Cdp, IO, Exception} a ->{IO, Exception} a
+Cdp.connect base needle thunk = Cdp.run (Cdp.Target.wsUrl (Cdp.pageFor base needle)) thunk
+
+-- ---------- test double ----------
+
+Cdp.fakeHandler : (Text -> Text -> Text) -> Nat -> Request {Cdp} a ->{Exception} a
+Cdp.fakeHandler f next = cases
+  { a } -> a
+  { Cdp.send m p -> resume } ->
+    reply = Json.toText (Json.Object [("id", Json.nat next), ("result", Json.fromText (f m p))])
+    handle resume reply with Cdp.fakeHandler f (next + 1)
+  { Cdp.drain -> resume } -> handle resume [] with Cdp.fakeHandler f next
+
+-- f method paramsJson returns the RESULT object text, e.g. {"result":{"value":3}}
+Cdp.fake : (Text -> Text -> Text) -> '{Cdp, Exception} a ->{Exception} a
+Cdp.fake f thunk = handle !thunk with Cdp.fakeHandler f 1
+
+-- ---------- calls and helpers ----------
+
+-- the "result" object of a command; raises on a protocol error
+Cdp.call : Text -> Text ->{Cdp, Exception} Json
+Cdp.call method params =
+  reply = Json.fromText (Cdp.send method params)
+  match Jx.get "error" reply with
+    Some e -> Exception.raiseGeneric ("cdp " ++ method ++ ": " ++ Json.toText e) method
+    None -> match Jx.get "result" reply with
+      Some r -> r
+      None -> Json.Object []
+
+-- JavaScript string literal (JSON text is valid JS)
+Cdp.js : Text -> Text
+Cdp.js t = Json.toText (Json.Text t)
+
+-- evaluate an expression in the page (awaits promises) and return its value as JSON
+Cdp.eval : Text ->{Cdp, Exception} Json
+Cdp.eval expr =
+  r = Cdp.call "Runtime.evaluate" (Json.toText (Json.Object [("expression", Json.Text expr), ("returnByValue", Json.Boolean true), ("awaitPromise", Json.Boolean true)]))
+  match Jx.get "exceptionDetails" r with
+    Some d -> Exception.raiseGeneric ("js exception: " ++ Json.toText d) expr
+    None -> match Jx.get "result" r with
+      Some res -> match Jx.get "value" res with
+        Some v -> v
+        None -> Json.Null
+      None -> Json.Null
+
+-- evaluate and return the value as text (strings unquoted)
+Cdp.evalText : Text ->{Cdp, Exception} Text
+Cdp.evalText expr = match Cdp.eval expr with
+  Json.Text t -> t
+  other -> Json.toText other
+
+Cdp.evalBool : Text ->{Cdp, Exception} Boolean
+Cdp.evalBool expr = match Cdp.eval expr with
+  Json.Boolean b -> b
+  _ -> false
+
+unique type Cdp.Wait = Load | Selector Text | Contains Text
+
+Cdp.Wait.condition : Cdp.Wait -> Text
+Cdp.Wait.condition = cases
+  Cdp.Wait.Load -> "document.readyState === 'complete'"
+  Cdp.Wait.Selector s -> "document.querySelector(" ++ Cdp.js s ++ ") !== null"
+  Cdp.Wait.Contains t -> "(document.body ? document.body.innerText : '').includes(" ++ Cdp.js t ++ ")"
+
+-- poll the condition every 50 ms for up to timeoutMs; false on timeout
+Cdp.waitFor : Cdp.Wait -> Nat ->{Cdp, IO, Exception} Boolean
+Cdp.waitFor w timeoutMs =
+  ok = match Exception.catch do Cdp.evalBool (Cdp.Wait.condition w) with
+    Right b -> b
+    Left _ -> false
+  if ok then true
+  else if timeoutMs < 50 then false
+  else
+    sleepMicroseconds 50000
+    Cdp.waitFor w (timeoutMs - 50)
+
+-- navigate and wait for load (10 s); returns false when the page did not finish loading
+Cdp.navigate : Text ->{Cdp, IO, Exception} Boolean
+Cdp.navigate url =
+  _ = Cdp.call "Page.navigate" (Json.toText (Json.Object [("url", Json.Text url)]))
+  sleepMicroseconds 100000
+  Cdp.waitFor Cdp.Wait.Load 10000
+
+-- visible text of the page
+Cdp.readPage : '{Cdp, Exception} Text
+Cdp.readPage = do Cdp.evalText "document.body ? document.body.innerText : ''"
+
+-- click the first element matching a CSS selector; false when there is none
+Cdp.click : Text ->{Cdp, Exception} Boolean
+Cdp.click selector = Cdp.evalBool ("(() => { const e = document.querySelector(" ++ Cdp.js selector ++ "); if (!e) return false; e.scrollIntoView({block:'center'}); e.click(); return true })()")
+
+-- focus the element and insert text as if typed (inputs and contenteditable); false when there is no such element
+Cdp.typeText : Text -> Text ->{Cdp, Exception} Boolean
+Cdp.typeText selector text =
+  found = Cdp.evalBool ("(() => { const e = document.querySelector(" ++ Cdp.js selector ++ "); if (!e) return false; e.focus(); return true })()")
+  if found then
+    _ = Cdp.call "Input.insertText" (Json.toText (Json.Object [("text", Json.Text text)]))
+    true
+  else false
+
+-- PNG screenshot of the page to a file; returns the byte count
+Cdp.screenshot : Text ->{Cdp, IO, Exception} Nat
+Cdp.screenshot path =
+  r = Cdp.call "Page.captureScreenshot" (Json.toText (Json.Object [("format", Json.Text "png")]))
+  b64 = Jx.need "screenshot data" (Jx.getText "data" r)
+  bytes = Bytes.fromBase64 (Text.toUtf8 b64)
+  writeFile (FilePath path) bytes
+  Bytes.size bytes
+
+test> Cdp.tests.fake =
+  r = Exception.catch do Cdp.fake (m p -> if m == "Runtime.evaluate" then "{\"result\":{\"type\":\"number\",\"value\":3}}" else "{}") do Cdp.eval "1+2"
+  match r with
+    Right v -> check (v === Json.nat 3)
+    Left _ -> [Fail "exception"]
