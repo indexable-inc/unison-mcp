@@ -3,7 +3,7 @@
 import os, re, sys
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-topics = ["unison-basics", "http-json", "mcp-client", "oauth", "cdp", "process-ffi", "traps"]
+topics = ["unison-basics", "http-json", "mcp-client", "oauth", "cdp", "process-ffi", "traps", "evolve"]
 
 
 def camel(t):

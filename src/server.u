@@ -45,21 +45,21 @@ Server.description : Text
 Server.description = Text.join "\n" [
   "Unison REPL, general MCP client and Chrome driver. Action 'run' executes Unison (ucm 1.5) code in a local codebase (code = the body of a do block of type '{IO, Exception} a), so everything below is a one-line cell; never conclude Unison cannot do it.",
   "Cells: MCP client for any server in ~/.local/share/uni/mcp/servers.json (stdio or HTTP, OAuth sign-in with a browser pop-up): Mcp.login \"x\" ; Mcp.run do Mcp.call \"x\" \"tool\" \"{\\\"k\\\":1}\" ; Mcp.run do Mcp.toolNames \"x\". Chrome over CDP: Cdp.connect Cdp.endpoint \"github.com\" do !Cdp.readPage (also Cdp.navigate, eval, click, typeText, screenshot). Processes: (i, o, e, p) = Process.start \"git\" [\"status\"] then getText o. HTTP: Threads.run do Http.run do HttpResponse.bodyText (Http.get (URI.parse \"https://example.com\")).",
-  "Actions: check (default: typecheck 'code'; '> expr' and 'test>' lines run), run (code; or 'name' of a committed definition with 'args'; code that has definitions ends with one '> expr' line), update, view, search, type-search, install, docs, tests, diff, guide, tools, tool (raw ucm tool: 'name', 'json').",
+  "Actions: check (default: typecheck 'code'; '> expr' and 'test>' lines run), run (code; or 'name' of a committed definition with 'args'; code that has definitions ends with one '> expr' line), update, view, search, type-search, install, docs, tests, diff, sync, guide, tools, tool (raw ucm tool: 'name', 'json').",
   "Replies start with 'stage:', 'ok:', 'class:' (wrong-name, ambiguous-name, type-mismatch, unhandled-ability, parse-error, usage, timeout, child-died, none). A result over ~12k characters is cut to head and tail; the full text is in a file whose path is returned.",
-  "Traps: (1) look up library names first with action 'search'; guessing is the top error. (2) Named functions are never infix: Nat.mod a b. (3) Function first: List.foreach printLine xs. (4) Compile errors are data and ucm exits 0 anyway: read 'ok:'. (5) Give each program a unique name; run can pick an older committed one.",
-  "Action 'guide' (optional 'topic': unison-basics, http-json, mcp-client, oauth, cdp, process-ffi, traps) returns the full cheat sheet."]
+  "Traps: (1) look up library names first with action 'search'; guessing is the top error. (2) Named functions are never infix: Nat.mod a b. (3) Function first: List.foreach printLine xs. (4) Compile errors are data and ucm exits 0 anyway: read 'ok:'. (5) Unique program names (run can pick an older committed one).",
+  "Action 'guide' (optional 'topic': unison-basics, http-json, mcp-client, oauth, cdp, process-ffi, traps, evolve) returns the full cheat sheet."]
 
 Server.schema : Json
 Server.schema =
   str d = Json.Object [("type", Json.Text "string"), ("description", Json.Text d)]
-  actions = Json.Array (List.map Json.Text ["check", "run", "update", "view", "search", "type-search", "install", "docs", "tests", "diff", "guide", "tools", "tool"])
+  actions = Json.Array (List.map Json.Text ["check", "run", "update", "view", "search", "type-search", "install", "docs", "tests", "diff", "sync", "guide", "tools", "tool"])
   Json.Object [
     ("type", Json.Text "object"),
     ("properties", Json.Object [
       ("code", str "Unison source (check, update, diff, type-search) or the body of a do block (run without name)."),
       ("action", Json.Object [("type", Json.Text "string"), ("enum", actions), ("description", Json.Text "What to do; default check.")]),
-      ("topic", str "For action guide: unison-basics, http-json, mcp-client, oauth, cdp, process-ffi, traps (default: index plus unison-basics and traps)."),
+      ("topic", str "For action guide: unison-basics, http-json, mcp-client, oauth, cdp, process-ffi, traps, evolve (default: index plus unison-basics and traps)."),
       ("name", str "Definition name(s), search query, library project, tests subnamespace or raw tool name, depending on action."),
       ("args", Json.Object [("type", Json.Text "array"), ("items", Json.Object [("type", Json.Text "string")]), ("description", Json.Text "Arguments of the run main function, or [branch] for install.")]),
       ("json", str "Raw JSON arguments for action tool."),
@@ -246,6 +246,60 @@ Server.reqText k args = Jx.need ("input '" ++ k ++ "'") (Jx.getText k args)
 Server.splitNames : Text -> [Text]
 Server.splitNames t = List.filter (s -> Text.size s > 0) (Text.split ?\s (Text.join " " (Text.split ?, t)))
 
+-- ---------- self-evolving codebase ----------
+
+-- After a successful change to the codebase (update, install, run with code and a name, raw update tools):
+-- hand the reply text to the evolve script, which snapshots the codebase and commits it to the private repo.
+-- Enabled only when UNISON_MCP_EVOLVE_SCRIPT and UNISON_MCP_EVOLVE_REPO are set; it never fails or blocks the call
+-- (the script detaches at once and does the slow work in the background).
+Server.evolve : Server.Config -> Text -> Text ->{IO} ()
+Server.evolve cfg action output =
+  script = Server.env "UNISON_MCP_EVOLVE_SCRIPT" ""
+  repo = Server.env "UNISON_MCP_EVOLVE_REPO" ""
+  if Text.size script == 0 || Text.size repo == 0 then ()
+  else
+    go = do
+      (i, o, e, p) = Process.start script ["commit", "--codebase", Server.Config.codebase cfg, "--repo", repo, "--session", Server.Config.sid cfg, "--lane", Server.env "UNISON_MCP_LANE" "", "--action", action, "--project", Server.Config.project cfg, "--branch", Server.Config.branch cfg]
+      _ = Exception.catch do putText i output
+      _ = Exception.catch do Handle.close i
+      _ = Process.wait p
+      ()
+    _ = Exception.catch go
+    ()
+
+-- run the hook when the step succeeded; the step's result is returned unchanged
+Server.evolved : Server.Config -> Text -> Either Stdio.Error (Boolean, Text) ->{IO} Either Stdio.Error (Boolean, Text)
+Server.evolved cfg action r = match r with
+  Right (true, t) ->
+    Server.evolve cfg action t
+    r
+  _ -> r
+
+-- ucm tools that change the codebase (raw 'tool' action)
+Server.mutating : Text -> Boolean
+Server.mutating n = match List.find (m -> m === n) ["update-definitions", "delete-definitions", "delete-namespace", "rename-definition", "move-definition", "move-to", "lib-install"] with
+  Some _ -> true
+  None -> false
+
+-- action sync: pull (fast-forward) and push the private repo through the evolve script. Our own ucm child is stopped
+-- first so it does not hold the codebase lock (it restarts on the next call). Right (ok, text)
+Server.sync : Server.Config -> Stdio.Child ->{IO} Text
+Server.sync cfg c =
+  script = Server.env "UNISON_MCP_EVOLVE_SCRIPT" ""
+  repo = Server.env "UNISON_MCP_EVOLVE_REPO" ""
+  if Text.size script == 0 || Text.size repo == 0 then Server.header "sync" false "usage" ++ "sync is off: set UNISON_MCP_EVOLVE_REPO (the private codebase repo) in ~/.local/share/uni/unison-mcp.env (see the guide topic evolve)"
+  else
+    Stdio.stop c
+    go = do
+      (i, o, e, p) = Process.start script ["sync", "--codebase", Server.Config.codebase cfg, "--repo", repo, "--project", Server.Config.project cfg, "--branch", Server.Config.branch cfg]
+      _ = Exception.catch do Handle.close i
+      out = getText o
+      rc = Process.wait p
+      (rc, out)
+    match Exception.catch go with
+      Right (rc, out) -> Server.header "sync" (rc == 0) (if rc == 0 then "none" else "error") ++ out
+      Left f -> Server.header "sync" false "error" ++ "sync failed to start: " ++ Jx.message f
+
 -- the action dispatcher: Right (ok, text) or a transport error
 Server.act : Server.Config -> Stdio.Child -> Nat -> Json ->{IO} Either Stdio.Error Text
 Server.act cfg c seq args =
@@ -272,7 +326,8 @@ Server.act cfg c seq args =
       Some src -> fin (Server.step "typecheck" c ms base "typecheck-code" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text src)])]))
     "update" -> match code with
       None -> usage "update needs 'code'"
-      Some src -> fin (Server.step "update" c ms base "update-definitions" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text src)])]))
+      Some src -> fin (Server.evolved cfg "update" (Server.step "update" c ms base "update-definitions" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text src)])])))
+    "sync" -> Right (Server.sync cfg c)
     "diff" -> match code with
       None -> usage "diff needs 'code'"
       Some src -> fin (Server.step "diff" c ms base "diff-update" (Json.Object [("projectContext", pc), ("code", Json.Object [("text", Json.Text src)])]))
@@ -281,7 +336,7 @@ Server.act cfg c seq args =
       runName n = Server.step "run" c ms (base + 2) "run" (Json.Object [("projectContext", pc), ("mainFunctionName", Json.Text n), ("args", runArgs)])
       match (name, code) with
         (Some n, None) -> fin (runName n)
-        (Some n, Some src) -> match Server.step "update" c ms base "update-definitions" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text src)])]) with
+        (Some n, Some src) -> match Server.evolved cfg "run" (Server.step "update" c ms base "update-definitions" (Json.Object [("projectContext", pc), ("code", Json.Object [("sourceCode", Json.Text src)])])) with
           Left e -> Left e
           Right (false, t) -> Right t
           Right (true, _) -> fin (runName n)
@@ -331,7 +386,7 @@ Server.act cfg c seq args =
         branch = match List.head (Jx.getTexts "args" args) with
           Some b -> Json.Text b
           None -> Json.Null
-        fin (Server.step "install" c ms base "lib-install" (Json.Object [("projectContext", pc), ("libProjectName", Json.Text n), ("libBranchName", branch)]))
+        fin (Server.evolved cfg "install" (Server.step "install" c ms base "lib-install" (Json.Object [("projectContext", pc), ("libProjectName", Json.Text n), ("libBranchName", branch)])))
     "docs" -> match need "name" with
       Left e -> Left e
       Right n -> fin (Server.step "docs" c ms base "docs" (Json.Object [("projectContext", pc), ("name", Json.Text n)]))
@@ -367,7 +422,8 @@ Server.act cfg c seq args =
             withPc = match Jx.get "projectContext" (Json.Object kvs) with
               Some _ -> kvs
               None -> kvs List.++ [("projectContext", pc)]
-            fin (Server.step n c ms base n (Json.Object withPc))
+            res = Server.step n c ms base n (Json.Object withPc)
+            fin (if Server.mutating n then Server.evolved cfg ("tool " ++ n) res else res)
           Right _ -> usage "json must be an object"
     other -> usage ("unknown action '" ++ other ++ "'")
 

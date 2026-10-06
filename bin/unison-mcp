@@ -6,8 +6,15 @@
 #   UNISON_MCP_SKIP_PIN_CHECK=1 skips the sha256 check of the ucm binary against ucm.pin
 # The server runs in its own process group together with the `ucm mcp` child it supervises;
 # when this script exits (stdin closed, SIGTERM, SIGHUP, SIGINT) the whole group is killed.
+#   UNISON_MCP_CONFIG     KEY=VALUE file sourced first (default ~/.local/share/uni/unison-mcp.env): the self-evolving codebase,
+#                         UNISON_MCP_EVOLVE_REPO (private git repo), UNISON_MCP_EVOLVE_PUSH=1, UNISON_MCP_LANE (see guide topic evolve)
 set -u
 self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cfgfile="${UNISON_MCP_CONFIG:-$HOME/.local/share/uni/unison-mcp.env}"
+if [ -f "$cfgfile" ]; then set -a; . "$cfgfile"; set +a; fi
+if [ -n "${UNISON_MCP_EVOLVE_REPO:-}" ] && [ -z "${UNISON_MCP_EVOLVE_SCRIPT:-}" ] && [ -x "$self/unison-evolve" ]; then
+  export UNISON_MCP_EVOLVE_SCRIPT="$self/unison-evolve"
+fi
 ucm_dir="${UNISON_MCP_UCM_DIR:-$HOME/.local/share/uni/ucm/release-1.5.0}"
 export UNISON_MCP_CODEBASE="${UNISON_MCP_CODEBASE:-$HOME/.local/share/uni/codebase}"
 export UNISON_MCP_UCM="$ucm_dir/unison/unison"

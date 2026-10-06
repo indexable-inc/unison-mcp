@@ -23,6 +23,7 @@ fi
 "$here/scripts/build.sh" "$cb" "$tmpuc"
 "$here/scripts/verify-install.sh" "$cb"
 install -m 755 "$here/bin/unison-mcp" "$dest/unison-mcp"
+install -m 755 "$here/scripts/evolve.py" "$dest/unison-evolve"
 install -m 644 "$tmpuc" "$dest/unison-mcp.uc"
 install -m 644 "$here/ucm.pin" "$dest/ucm.pin"
 rm -f "$tmpuc"

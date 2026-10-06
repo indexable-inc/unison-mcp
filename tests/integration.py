@@ -157,7 +157,7 @@ class Unison(Base):
         self.assertIn("typecheck-code", self.c.tool(action="tools")[1])
 
     def test_guide_topics(self):
-        topics = ["unison-basics", "http-json", "mcp-client", "oauth", "cdp", "process-ffi", "traps"]
+        topics = ["unison-basics", "http-json", "mcp-client", "oauth", "cdp", "process-ffi", "traps", "evolve"]
         listed = self.c.rpc("tools/list")["result"]["tools"][0]["description"]
         for t in topics:
             self.assertIn(t, listed)
